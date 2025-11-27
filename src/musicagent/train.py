@@ -161,6 +161,12 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--wandb-project", type=str, default="musicagent")
     parser.add_argument("--run-name", type=str, default=None, help="Custom wandb run name")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to a model checkpoint (.pt) to warm-start from before training.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument(
         "--deterministic",
@@ -266,6 +272,18 @@ def main():
     model = OfflineTransformer(m_cfg, d_cfg, vocab_src_len, vocab_tgt_len).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
+
+    # Optionally warm-start from an existing checkpoint (e.g., best_model.pt).
+    if args.resume_from is not None:
+        if args.resume_from.is_file():
+            state_dict = torch.load(args.resume_from, map_location=device)
+            model.load_state_dict(state_dict, strict=True)
+            logger.info(f"Loaded checkpoint from {args.resume_from}")
+        else:
+            logger.warning(
+                f"--resume-from was set to {args.resume_from}, but file does not exist. "
+                "Continuing with randomly initialized weights."
+            )
 
     optimizer = optim.AdamW(model.parameters(), lr=m_cfg.lr, weight_decay=0.01)
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
