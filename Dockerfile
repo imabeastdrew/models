@@ -18,8 +18,6 @@ ENV PATH="/workspace/.venv/bin:${PATH}" \
 
 COPY src ./src
 COPY scripts ./scripts
-COPY docs ./docs
-COPY README.md ./
 
 RUN uv pip install -e . --no-deps
 
