@@ -1,4 +1,5 @@
 import json
+import logging
 import random
 
 import numpy as np
@@ -6,6 +7,9 @@ import torch
 from torch.utils.data import Dataset
 
 from musicagent.config import DataConfig
+
+logger = logging.getLogger(__name__)
+
 
 
 class MusicAgentDataset(Dataset):
@@ -78,6 +82,9 @@ class MusicAgentDataset(Dataset):
                 new_token = f"pitch_{new_pitch}_{kind}"
                 new_id = vocab.get(new_token)
                 if new_id is None:
+                    logger.warning(
+                        f"Token {new_token} not found in vocab after transposition (original: {token}, semitones: {semitones})"
+                    )
                     continue
                 result[i] = new_id
             else:
@@ -106,6 +113,9 @@ class MusicAgentDataset(Dataset):
                 new_token = f"{new_root}:{rest}{suffix}"
                 new_id = vocab.get(new_token)
                 if new_id is None:
+                    logger.warning(
+                        f"Token {new_token} not found in vocab after transposition (original: {token}, semitones: {semitones})"
+                    )
                     continue
                 result[i] = new_id
 

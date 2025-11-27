@@ -37,16 +37,32 @@ def count_parameters(model: nn.Module) -> int:
 
 
 def train_epoch(
-    model, loader, optimizer, scheduler, criterion, device, epoch,
-    global_step, use_wandb=True, log_interval=100
+    model,
+    loader,
+    optimizer,
+    scheduler,
+    criterion,
+    device,
+    epoch,
+    global_step,
+    use_wandb: bool = True,
+    log_interval: int = 100,
 ):
     model.train()
     total_loss = 0.0
     start_time = time.time()
 
     for i, batch in enumerate(loader):
-        src = batch['src'].to(device)
-        tgt = batch['tgt'].to(device)
+        # DataLoader + collate_fn returns a tuple (src_batch, tgt_batch).
+        # For robustness, also support a dict-style batch.
+        if isinstance(batch, tuple):
+            src, tgt = batch
+        else:
+            src = batch["src"]
+            tgt = batch["tgt"]
+
+        src = src.to(device)
+        tgt = tgt.to(device)
 
         tgt_input = tgt[:, :-1]
         tgt_y = tgt[:, 1:]
@@ -93,19 +109,49 @@ def train_epoch(
 def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
+    total_tokens = 0
+    
     with torch.no_grad():
         for batch in loader:
-            src = batch['src'].to(device)
-            tgt = batch['tgt'].to(device)
+            if isinstance(batch, tuple):
+                src, tgt = batch
+            else:
+                src = batch["src"]
+                tgt = batch["tgt"]
+
+            src = src.to(device)
+            tgt = tgt.to(device)
 
             tgt_input = tgt[:, :-1]
             tgt_y = tgt[:, 1:]
 
             output = model(src, tgt_input)
-            loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
-            total_loss += loss.item()
+            
+            # Flatten for loss calculation
+            flat_output = output.reshape(-1, output.size(-1))
+            flat_targets = tgt_y.reshape(-1)
+            
+            # Calculate loss (sum instead of mean to aggregate correctly)
+            loss = criterion(flat_output, flat_targets)
+            
+            # If criterion is reduction='mean' (default), we need to multiply by batch size 
+            # or number of valid tokens if we want accurate weighted average.
+            # However, CrossEntropyLoss with ignore_index averages over non-ignored tokens.
+            # It's better to get the sum and divide by total non-ignored tokens manually if we want exactness,
+            # but a simpler improvement is to weight by batch size.
+            # Let's assume we want average per-batch for now but robust to last batch size.
+            
+            # Better approach: use reduction='sum' in criterion if we could control it, 
+            # but here it is passed in.
+            # Assuming default mean reduction:
+            batch_size = src.size(0)
+            total_loss += loss.item() * batch_size
+            total_tokens += batch_size
 
-    return total_loss / len(loader)
+    if total_tokens == 0:
+        return 0.0
+        
+    return total_loss / total_tokens
 
 
 def main():
@@ -145,6 +191,11 @@ def main():
         type=int,
         help="Number of warmup steps for the learning-rate scheduler.",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        help="Device to run training on (cuda/cpu).",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -176,6 +227,15 @@ def main():
         m_cfg.lr = args.lr
     if args.warmup_steps is not None:
         m_cfg.warmup_steps = args.warmup_steps
+
+    # Check for valid model configuration
+    if m_cfg.d_model % m_cfg.n_heads != 0:
+        raise ValueError(
+            f"d_model ({m_cfg.d_model}) must be divisible by n_heads ({m_cfg.n_heads})"
+        )
+
+    if args.device:
+        m_cfg.device = args.device
 
     device = torch.device(m_cfg.device)
     logger.info(f"Using device: {device}")
@@ -259,7 +319,11 @@ def main():
             device, epoch, global_step, use_wandb
         )
         val_loss = evaluate(model, valid_loader, criterion, device)
-        val_ppl = math.exp(val_loss)
+        # Clamp val_loss to avoid overflow in exp
+        try:
+            val_ppl = math.exp(min(val_loss, 100))
+        except OverflowError:
+            val_ppl = float('inf')
 
         logger.info("-" * 89)
         logger.info(
@@ -284,7 +348,10 @@ def main():
             if use_wandb:
                 # Update summary metrics.
                 wandb.run.summary["best_val_loss"] = best_val_loss
-                wandb.run.summary["best_val_perplexity"] = math.exp(best_val_loss)
+                try:
+                    wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
+                except OverflowError:
+                    wandb.run.summary["best_val_perplexity"] = float('inf')
                 wandb.run.summary["best_epoch"] = epoch
 
                 # Log best-model checkpoint as a W&B artifact.
