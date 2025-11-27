@@ -14,5 +14,6 @@ __pycache__/
 realchords_data/
 sheetsage-data/
 docs/
+*.tar.gz
 
 

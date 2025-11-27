@@ -21,4 +21,5 @@ runs/
 Thumbs.db
 .ipynb_checkpoints/
 docs/
+*.tar.gz
 

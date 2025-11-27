@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "musicagent"
 version = "0.1.0"
-description = "Melody to Chord prediction (ReaLchords reimplementation)"
+description = "Melody to Chord prediction"
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24.0",
