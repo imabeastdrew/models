@@ -9,13 +9,10 @@ An unfaithful reimplementation of ReaLchords paper.
 uv sync
 ```
 
-## Training EX
+## Training Example
 
 ```bash
 python -m musicagent.train --epochs 20
-
-# Custom wandb project/run name
-python -m musicagent.train --wandb-project my-project --run-name exp-1
 ```
 
 ## CLI
@@ -26,4 +23,3 @@ The training module exposes a CLI; run:
 python -m musicagent.train --help
 ```
 
-to see flags.
