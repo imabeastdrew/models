@@ -34,10 +34,9 @@ jobs:
       - name: Run pytest
         run: uv run pytest
 
-      - name: W&B smoke
+      - name: W&B smoke 
         env:
           WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
-          WANDB_MODE: offline
         run: |
           uv run python - << 'EOF'
           import wandb

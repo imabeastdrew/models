@@ -282,9 +282,23 @@ def main():
             logger.info("Saved best model.")
 
             if use_wandb:
+                # Update summary metrics.
                 wandb.run.summary["best_val_loss"] = best_val_loss
                 wandb.run.summary["best_val_perplexity"] = math.exp(best_val_loss)
                 wandb.run.summary["best_epoch"] = epoch
+
+                # Log best-model checkpoint as a W&B artifact.
+                artifact = wandb.Artifact(
+                    name="best-model",
+                    type="model",
+                    metadata={
+                        "epoch": epoch,
+                        "val_loss": val_loss,
+                        "val_perplexity": val_ppl,
+                    },
+                )
+                artifact.add_file(str(checkpoint_path))
+                wandb.log_artifact(artifact, aliases=["best", f"epoch-{epoch}"])
 
     if use_wandb:
         wandb.finish()
