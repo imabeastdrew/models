@@ -101,8 +101,9 @@ def note_in_chord_ratio(
         midi_pitch = parse_melody_token(mel_tok)
         root, quality = parse_chord_token(chd_tok)
 
-        if midi_pitch is None or root is None:
-            continue  # skip silent / special
+        # Skip silent / special frames where either melody or chord is not a real pitch.
+        if midi_pitch is None or root is None or quality is None:
+            continue
 
         melody_pc = midi_pitch % 12
         chord_pcs = chord_pitch_classes(root, quality)
