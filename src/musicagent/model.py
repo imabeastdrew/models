@@ -89,3 +89,79 @@ class OfflineTransformer(nn.Module):
 
         logits: torch.Tensor = self.fc_out(out)
         return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        src: torch.Tensor,
+        max_len: int,
+        sos_id: int,
+        eos_id: int,
+        temperature: float = 1.0,
+        sample: bool = False,
+    ) -> torch.Tensor:
+        """Autoregressively generate chord sequence given melody.
+
+        Args:
+            src: (batch, src_len) melody token IDs
+            max_len: maximum output length
+            sos_id: start-of-sequence token ID
+            eos_id: end-of-sequence token ID
+            temperature: softmax temperature (ignored if sample=False)
+            sample: if True, sample from distribution; else greedy argmax
+
+        Returns:
+            (batch, generated_len) chord token IDs (including SOS)
+        """
+        device = src.device
+        batch_size = src.size(0)
+
+        # Pre-encode the source sequence once
+        src_key_padding_mask = (src == self.pad_id)
+        src_emb = self.pos_enc(self.src_embed(src))
+        memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+
+        # Start with SOS token
+        generated = torch.full((batch_size, 1), sos_id, dtype=torch.long, device=device)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        for _ in range(max_len - 1):
+            tgt_emb = self.pos_enc(self.tgt_embed(generated))
+
+            seq_len = generated.size(1)
+            tgt_mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+
+            out = self.transformer.decoder(
+                tgt_emb,
+                memory,
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=src_key_padding_mask,
+            )
+
+            logits = self.fc_out(out[:, -1, :])  # (batch, vocab)
+
+            if sample:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = logits.argmax(dim=-1, keepdim=True)
+
+            # For finished sequences, keep generating pad
+            next_token = torch.where(
+                finished.unsqueeze(1),
+                torch.full_like(next_token, self.pad_id),
+                next_token,
+            )
+
+            generated = torch.cat([generated, next_token], dim=1)
+
+            # Mark sequences that just produced EOS as finished
+            finished = finished | (next_token.squeeze(1) == eos_id)
+
+            if finished.all():
+                break
+
+        return generated
