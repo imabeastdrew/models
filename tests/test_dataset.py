@@ -1,12 +1,14 @@
 import json
-from pathlib import Path
 import logging
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 
 from musicagent.config import DataConfig
 from musicagent.dataset import MusicAgentDataset, collate_fn
+
 
 def _write_vocab(path: Path, token_to_id: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,7 +123,10 @@ def test_transpose_sequence_melody(tmp_path: Path) -> None:
     chord_token_to_id = {cfg.pad_token: cfg.pad_id}
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
-    src = np.array([[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32)
+    src = np.array(
+        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]],
+        dtype=np.int32
+    )
     tgt = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
     np.save(cfg.data_processed / "train_src.npy", src)
     np.save(cfg.data_processed / "train_tgt.npy", tgt)
@@ -135,7 +140,12 @@ def test_transpose_sequence_melody(tmp_path: Path) -> None:
 
 def test_transpose_sequence_chord(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=4, max_len=4, max_transpose=12)
-    melody_token_to_id = {cfg.pad_token: cfg.pad_id, cfg.sos_token: cfg.sos_id, cfg.eos_token: cfg.eos_id, cfg.rest_token: cfg.rest_id}
+    melody_token_to_id = {
+        cfg.pad_token: cfg.pad_id,
+        cfg.sos_token: cfg.sos_id,
+        cfg.eos_token: cfg.eos_id,
+        cfg.rest_token: cfg.rest_id
+    }
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     chord_token_to_id = {
         cfg.pad_token: cfg.pad_id,
@@ -150,7 +160,10 @@ def test_transpose_sequence_chord(tmp_path: Path) -> None:
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
     src = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
-    tgt = np.array([[cfg.sos_id, chord_token_to_id["C:4-3/0_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32)
+    tgt = np.array(
+        [[cfg.sos_id, chord_token_to_id["C:4-3/0_on"], cfg.eos_id, cfg.pad_id]],
+        dtype=np.int32
+    )
     np.save(cfg.data_processed / "train_src.npy", src)
     np.save(cfg.data_processed / "train_tgt.npy", tgt)
 
@@ -165,7 +178,10 @@ def test_transpose_zero_semitones_unchanged(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=16, max_len=16)
     melody_vocab, _ = _create_test_dataset(tmp_path, cfg)
     ds = MusicAgentDataset(cfg, split="train")
-    original = np.array([cfg.sos_id, melody_vocab["pitch_60_on"], cfg.eos_id], dtype=np.int32)
+    original = np.array(
+        [cfg.sos_id, melody_vocab["pitch_60_on"], cfg.eos_id],
+        dtype=np.int32
+    )
     transposed = ds._transpose_sequence(original, semitones=0, is_src=True)
     assert np.array_equal(original, transposed)
 
@@ -195,7 +211,7 @@ def test_dataset_length_mismatch(tmp_path: Path) -> None:
 def test_transpose_missing_token_logs_warning(tmp_path: Path, caplog) -> None:
     """_transpose_sequence should log a warning when a token is not in vocab."""
     cfg = DataConfig(data_processed=tmp_path, storage_len=4, max_len=4, max_transpose=12)
-    
+
     # Create vocab with pitch 60 but NOT pitch 62
     melody_token_to_id = {
         cfg.pad_token: cfg.pad_id,
@@ -206,24 +222,26 @@ def test_transpose_missing_token_logs_warning(tmp_path: Path, caplog) -> None:
     }
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     _write_vocab(cfg.vocab_chord, {cfg.pad_token: 0})
-    
-    src = np.array([[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32)
+
+    src = np.array(
+        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]],
+        dtype=np.int32
+    )
     tgt = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
     np.save(cfg.data_processed / "train_src.npy", src)
     np.save(cfg.data_processed / "train_tgt.npy", tgt)
-    
+
     ds = MusicAgentDataset(cfg, split="train")
-    
+
     # Transpose +2 semitones (pitch_60_on -> pitch_62_on).
-    # pitch_62_on is NOT in vocab, so it should log a warning and keep original? 
-    # Or just keep whatever the method does (currently skips, leaving original value from copy? No, seq is copied at start).
-    # The method does: result = seq.copy(), then iterate. If missing, continue (skipping assignment).
-    # So the result at that index will remain 4 (pitch_60_on).
-    # Wait, if we skip, we leave the OLD token ID there.
-    
+    # pitch_62_on is NOT in vocab, so it should log a warning and keep original.
+    # The method copies sequence first, then if missing continues loop
+    # (so index stays as original)
+
     with caplog.at_level(logging.WARNING):
         transposed = ds._transpose_sequence(src[0], semitones=2, is_src=True)
-        
+
     assert "Token pitch_62_on not found in vocab" in caplog.text
     # The token should remain unchanged because we `continue`d the loop
     assert transposed[1] == melody_token_to_id["pitch_60_on"]
+

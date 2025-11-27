@@ -110,7 +110,7 @@ def evaluate(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
     total_tokens = 0
-    
+
     with torch.no_grad():
         for batch in loader:
             if isinstance(batch, tuple):
@@ -126,22 +126,22 @@ def evaluate(model, loader, criterion, device):
             tgt_y = tgt[:, 1:]
 
             output = model(src, tgt_input)
-            
+
             # Flatten for loss calculation
             flat_output = output.reshape(-1, output.size(-1))
             flat_targets = tgt_y.reshape(-1)
-            
+
             # Calculate loss (sum instead of mean to aggregate correctly)
             loss = criterion(flat_output, flat_targets)
-            
-            # If criterion is reduction='mean' (default), we need to multiply by batch size 
+
+            # If criterion is reduction='mean' (default), we need to multiply by batch size
             # or number of valid tokens if we want accurate weighted average.
             # However, CrossEntropyLoss with ignore_index averages over non-ignored tokens.
-            # It's better to get the sum and divide by total non-ignored tokens manually if we want exactness,
-            # but a simpler improvement is to weight by batch size.
+            # It's better to get the sum and divide by total non-ignored tokens manually if we
+            # want exactness, but a simpler improvement is to weight by batch size.
             # Let's assume we want average per-batch for now but robust to last batch size.
-            
-            # Better approach: use reduction='sum' in criterion if we could control it, 
+
+            # Better approach: use reduction='sum' in criterion if we could control it,
             # but here it is passed in.
             # Assuming default mean reduction:
             batch_size = src.size(0)
@@ -150,7 +150,7 @@ def evaluate(model, loader, criterion, device):
 
     if total_tokens == 0:
         return 0.0
-        
+
     return total_loss / total_tokens
 
 
@@ -373,3 +373,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

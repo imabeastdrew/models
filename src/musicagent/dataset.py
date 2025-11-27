@@ -11,7 +11,6 @@ from musicagent.config import DataConfig
 logger = logging.getLogger(__name__)
 
 
-
 class MusicAgentDataset(Dataset):
     def __init__(self, config: DataConfig, split: str = 'train'):
         self.config = config
@@ -83,7 +82,8 @@ class MusicAgentDataset(Dataset):
                 new_id = vocab.get(new_token)
                 if new_id is None:
                     logger.warning(
-                        f"Token {new_token} not found in vocab after transposition (original: {token}, semitones: {semitones})"
+                        f"Token {new_token} not found in vocab after transposition "
+                        f"(original: {token}, semitones: {semitones})"
                     )
                     continue
                 result[i] = new_id
@@ -114,7 +114,8 @@ class MusicAgentDataset(Dataset):
                 new_id = vocab.get(new_token)
                 if new_id is None:
                     logger.warning(
-                        f"Token {new_token} not found in vocab after transposition (original: {token}, semitones: {semitones})"
+                        f"Token {new_token} not found in vocab after transposition "
+                        f"(original: {token}, semitones: {semitones})"
                     )
                     continue
                 result[i] = new_id

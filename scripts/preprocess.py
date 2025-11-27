@@ -7,7 +7,6 @@ import logging
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List
 
 import ijson
 import numpy as np
@@ -30,13 +29,13 @@ class Vocabulary:
     def __init__(self, name: str, config: DataConfig):
         self.name = name
         self.config = config
-        self.token_to_id: Dict[str, int] = {
+        self.token_to_id: dict[str, int] = {
             config.pad_token: config.pad_id,
             config.sos_token: config.sos_id,
             config.eos_token: config.eos_id,
             config.rest_token: config.rest_id,
         }
-        self.id_to_token: Dict[int, str] = {v: k for k, v in self.token_to_id.items()}
+        self.id_to_token: dict[int, str] = {v: k for k, v in self.token_to_id.items()}
         self.next_id = max(self.token_to_id.values()) + 1
         self.counts: Counter = Counter()
 
@@ -46,10 +45,10 @@ class Vocabulary:
             self.token_to_id[token] = self.next_id
             self.id_to_token[self.next_id] = token
             self.next_id += 1
-            
+
     def get_id(self, token: str) -> int:
         return self.token_to_id.get(token, self.config.rest_id)
-    
+
     def save(self, path: Path) -> None:
         with open(path, 'w') as f:
             json.dump({
@@ -62,8 +61,8 @@ class Vocabulary:
 class ChordMapper:
     def __init__(self):
         self.root_names = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
-        
-    def get_token(self, root_pc: int, intervals: List[int], inversion: int) -> str:
+
+    def get_token(self, root_pc: int, intervals: list[int], inversion: int) -> str:
         quality = "-".join(map(str, intervals))
         root = self.root_names[root_pc % 12]
         return f"{root}:{quality}/{inversion}"
@@ -80,11 +79,11 @@ def process_dataset(config: DataConfig) -> None:
 
     config.data_processed.mkdir(exist_ok=True, parents=True)
     logger.info(f"Processing {config.data_raw}...")
-    
+
     melody_vocab = Vocabulary("melody", config)
     chord_vocab = Vocabulary("chord", config)
     chord_mapper = ChordMapper()
-    
+
     # ==========================================
     # Pass 1: Build Vocabulary
     # ==========================================
@@ -92,7 +91,7 @@ def process_dataset(config: DataConfig) -> None:
     with open(config.data_raw, 'rb') as f:
         for _, data in tqdm(ijson.kvitems(f, ''), desc="Building Vocab"):
             annot = data.get('annotations', {})
-            
+
             # Augment the vocab by including all transpositions in [-max_transpose, max_transpose].
             for transpose in range(-config.max_transpose, config.max_transpose + 1):
                 if annot.get('melody'):
@@ -105,10 +104,12 @@ def process_dataset(config: DataConfig) -> None:
                 if annot.get('harmony'):
                     for c in annot['harmony']:
                         tp_root = (c['root_pitch_class'] + transpose) % 12
-                        token = chord_mapper.get_token(tp_root, c['root_position_intervals'], c['inversion'])
+                        token = chord_mapper.get_token(
+                            tp_root, c['root_position_intervals'], c['inversion']
+                        )
                         chord_vocab.add(f"{token}_on")
                         chord_vocab.add(f"{token}_hold")
-    
+
     melody_vocab.save(config.vocab_melody)
     chord_vocab.save(config.vocab_chord)
 
@@ -116,9 +117,9 @@ def process_dataset(config: DataConfig) -> None:
     # Pass 2: Tokenize and Save to NPY
     # ==========================================
     logger.info("Pass 2: Tokenizing to Numpy...")
-    
+
     buffers = defaultdict(lambda: {'src': [], 'tgt': []})
-    
+
     with open(config.data_raw, 'rb') as f:
         for _, data in tqdm(ijson.kvitems(f, ''), desc="Tokenizing"):
             split = data.get('split', 'TRAIN').lower()
@@ -126,7 +127,7 @@ def process_dataset(config: DataConfig) -> None:
             num_beats = annot.get('num_beats', 0)
             if num_beats <= 0:
                 continue
-            
+
             total_frames = int(num_beats * config.frame_rate)
 
             # No on-disk augmentation: we store sequences in their original key.
@@ -168,7 +169,9 @@ def process_dataset(config: DataConfig) -> None:
                     end = int(round(c['offset'] * config.frame_rate))
 
                     tp_root = (c['root_pitch_class'] + transpose) % 12
-                    base_token = chord_mapper.get_token(tp_root, c['root_position_intervals'], c['inversion'])
+                    base_token = chord_mapper.get_token(
+                        tp_root, c['root_position_intervals'], c['inversion']
+                    )
                     token_on = f"{base_token}_on"
                     token_hold = f"{base_token}_hold"
                     id_on = chord_vocab.get_id(token_on)
@@ -196,13 +199,13 @@ def process_dataset(config: DataConfig) -> None:
     for split, data in buffers.items():
         if not data['src']:
             continue
-        
+
         src_arr = np.stack(data['src'])
         tgt_arr = np.stack(data['tgt'])
-        
+
         out_src = config.data_processed / f"{split}_src.npy"
         out_tgt = config.data_processed / f"{split}_tgt.npy"
-        
+
         logger.info(f"Saving {split} src: {src_arr.shape} to {out_src}")
         np.save(out_src, src_arr)
         logger.info(f"Saving {split} tgt: {tgt_arr.shape} to {out_tgt}")
@@ -216,12 +219,12 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=Path, help="Input JSON path")
     parser.add_argument("--output", type=Path, help="Output directory")
     args = parser.parse_args()
-    
+
     cfg = DataConfig()
     if args.input:
         cfg.data_raw = args.input
     if args.output:
         cfg.data_processed = args.output
-    
+
     process_dataset(cfg)
 
