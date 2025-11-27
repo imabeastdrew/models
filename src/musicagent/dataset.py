@@ -1,6 +1,5 @@
 import json
 import random
-from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -13,23 +12,23 @@ class MusicAgentDataset(Dataset):
     def __init__(self, config: DataConfig, split: str = 'train'):
         self.config = config
         self.split = split
-        
+
         src_path = config.data_processed / f"{split}_src.npy"
         tgt_path = config.data_processed / f"{split}_tgt.npy"
-        
+
         if not src_path.exists():
             raise FileNotFoundError(f"Data not found at {src_path}")
-        
+
         self.src_data = np.load(src_path, mmap_mode='r')
         self.tgt_data = np.load(tgt_path, mmap_mode='r')
-        
+
         if len(self.src_data) != len(self.tgt_data):
             raise ValueError(f"Mismatch: src={len(self.src_data)}, tgt={len(self.tgt_data)}")
-            
+
         with open(config.vocab_melody) as f:
-            self.vocab_melody: Dict[str, int] = json.load(f)['token_to_id']
+            self.vocab_melody: dict[str, int] = json.load(f)['token_to_id']
         with open(config.vocab_chord) as f:
-            self.vocab_chord: Dict[str, int] = json.load(f)['token_to_id']
+            self.vocab_chord: dict[str, int] = json.load(f)['token_to_id']
 
         # Build reverse mappings for on-the-fly transposition.
         self.id_to_melody = {v: k for k, v in self.vocab_melody.items()}
@@ -114,8 +113,8 @@ class MusicAgentDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.src_data)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         src_arr = np.array(self.src_data[idx])
         tgt_arr = np.array(self.tgt_data[idx])
 
@@ -155,7 +154,7 @@ class MusicAgentDataset(Dataset):
         }
 
 
-def collate_fn(batch: list) -> Tuple[torch.Tensor, torch.Tensor]:
+def collate_fn(batch: list) -> tuple[torch.Tensor, torch.Tensor]:
     srcs = torch.stack([x['src'] for x in batch])
     tgts = torch.stack([x['tgt'] for x in batch])
     return srcs, tgts

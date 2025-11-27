@@ -17,7 +17,12 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
-def seed_everything(seed: int, *, deterministic: bool = False, extra_info: Optional[dict] = None) -> None:
+def seed_everything(
+    seed: int,
+    *,
+    deterministic: bool = False,
+    extra_info: Optional[dict] = None,
+) -> None:
     """Seed Python, NumPy, and PyTorch for reproducible experiments.
 
     Args:
@@ -26,7 +31,10 @@ def seed_everything(seed: int, *, deterministic: bool = False, extra_info: Optio
             (can be slower and may raise warnings if some ops are non-deterministic).
         extra_info: Optional dict to log alongside the seed settings.
     """
-    logging.getLogger(__name__).info("Seeding experiment", extra={"seed": seed, **(extra_info or {})})
+    logging.getLogger(__name__).info(
+        "Seeding experiment",
+        extra={"seed": seed, **(extra_info or {})},
+    )
 
     # Core RNGs
     random.seed(seed)

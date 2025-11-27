@@ -22,19 +22,27 @@ class PositionalEncoding(nn.Module):
 
 class OfflineTransformer(nn.Module):
     def __init__(
-        self, 
-        model_config: ModelConfig, 
-        data_config: DataConfig, 
-        vocab_src_size: int, 
+        self,
+        model_config: ModelConfig,
+        data_config: DataConfig,
+        vocab_src_size: int,
         vocab_tgt_size: int
     ):
         super().__init__()
         self.cfg = model_config
-        
-        self.src_embed = nn.Embedding(vocab_src_size, model_config.d_model, padding_idx=data_config.pad_id)
-        self.tgt_embed = nn.Embedding(vocab_tgt_size, model_config.d_model, padding_idx=data_config.pad_id)
+
+        self.src_embed = nn.Embedding(
+            vocab_src_size,
+            model_config.d_model,
+            padding_idx=data_config.pad_id,
+        )
+        self.tgt_embed = nn.Embedding(
+            vocab_tgt_size,
+            model_config.d_model,
+            padding_idx=data_config.pad_id,
+        )
         self.pos_enc = PositionalEncoding(model_config.d_model, data_config.max_len)
-        
+
         self.transformer = nn.Transformer(
             d_model=model_config.d_model,
             nhead=model_config.n_heads,
@@ -45,14 +53,14 @@ class OfflineTransformer(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        
+
         self.fc_out = nn.Linear(model_config.d_model, vocab_tgt_size)
         self.pad_id = data_config.pad_id
 
     def create_mask(self, src: torch.Tensor, tgt: torch.Tensor):
         src_key_padding_mask = (src == self.pad_id)
         tgt_key_padding_mask = (tgt == self.pad_id)
-        
+
         seq_len = tgt.size(1)
         # Causal attention mask: True where positions should be masked.
         # Shape: [tgt_len, tgt_len], with True above the main diagonal.
@@ -60,15 +68,15 @@ class OfflineTransformer(nn.Module):
             torch.ones(seq_len, seq_len, dtype=torch.bool, device=tgt.device),
             diagonal=1,
         )
-        
+
         return src_key_padding_mask, tgt_key_padding_mask, tgt_mask
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         src_key_mask, tgt_key_mask, tgt_mask = self.create_mask(src, tgt)
-        
+
         src_emb = self.pos_enc(self.src_embed(src))
         tgt_emb = self.pos_enc(self.tgt_embed(tgt))
-        
+
         out = self.transformer(
             src=src_emb,
             tgt=tgt_emb,
@@ -77,5 +85,5 @@ class OfflineTransformer(nn.Module):
             memory_key_padding_mask=src_key_mask,
             tgt_mask=tgt_mask
         )
-        
+
         return self.fc_out(out)
