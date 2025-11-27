@@ -13,5 +13,6 @@ __pycache__/
 .DS_Store
 realchords_data/
 sheetsage-data/
+docs/
 
 

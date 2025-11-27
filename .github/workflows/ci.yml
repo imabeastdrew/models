@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  tests:
-    name: Unit tests (uv + pytest)
+  lint-and-test:
+    name: Lint and tests (uv + Ruff + mypy + pytest)
     runs-on: ubuntu-latest
 
     steps:
@@ -22,16 +22,22 @@ jobs:
       - name: Install uv
         run: pip install uv
 
-      - name: Sync dependencies (locked)
+      - name: Sync dependencies (locked, with dev)
         run: uv sync --frozen --dev
 
-      - name: Run tests
+      - name: Run Ruff
+        run: uv run ruff check src tests
+
+      - name: Run mypy
+        run: uv run mypy src tests
+
+      - name: Run pytest
         run: uv run pytest
 
   docker-smoke-test:
     name: Docker training smoke test
     runs-on: ubuntu-latest
-    needs: tests
+    needs: lint-and-test
 
     steps:
       - name: Checkout
@@ -50,43 +56,4 @@ jobs:
             --deterministic \
             --max-len 64 \
             --batch-size 64
-
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-jobs:
-  lint-and-test:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install dependencies
-        run: uv sync --dev
-
-      - name: Run Ruff
-        run: uv run ruff check src tests
-
-      - name: Run mypy
-        run: uv run mypy src tests
-
-      - name: Run pytest
-        run: uv run pytest
-
 
