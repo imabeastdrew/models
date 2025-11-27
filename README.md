@@ -18,7 +18,7 @@ python -m musicagent.train --epochs 20
 python -m musicagent.train --wandb-project my-project --run-name exp-1
 ```
 
-### CLI
+## CLI
 
 The training module exposes a CLI; run:
 
