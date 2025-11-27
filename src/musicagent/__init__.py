@@ -1,4 +1,4 @@
-"""MusicAgent: Melody to Chord prediction using Transformers."""
+"""MusicAgent: Melody to Chord prediction."""
 
 from musicagent.config import DataConfig, ModelConfig
 from musicagent.dataset import MusicAgentDataset

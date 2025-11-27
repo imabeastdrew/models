@@ -15,7 +15,11 @@ def _write_vocab(path: Path, token_to_id: dict) -> None:
         json.dump({"token_to_id": token_to_id}, f)
 
 
-def _create_test_dataset(tmp_path: Path, cfg: DataConfig, n_samples: int = 5) -> None:
+def _create_test_dataset(
+    tmp_path: Path,
+    cfg: DataConfig,
+    n_samples: int = 5,
+) -> tuple[dict[str, int], dict[str, int]]:
     """Helper to create minimal dataset files for testing."""
     # Create melody vocab with special tokens + some pitch tokens
     melody_token_to_id = {
