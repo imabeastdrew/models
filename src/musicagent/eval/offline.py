@@ -1,4 +1,4 @@
-"""Evaluate offline model on test set with ReaLchords metrics."""
+"""Test set eval for offline model."""
 
 from __future__ import annotations
 
@@ -156,19 +156,19 @@ def main():
     ref_entropy = chord_length_entropy(all_ref_lengths)
 
     logger.info("=" * 60)
-    logger.info("ReaLchords Metrics (Offline Model Evaluation)")
+    logger.info("Metrics (Offline Eval)")
     logger.info("=" * 60)
     logger.info(f"Test Loss:                 {test_loss:.4f}")
     logger.info(f"Test Perplexity:           {test_ppl:.2f}")
     logger.info("-" * 60)
     logger.info(
-        f"Note-in-Chord Ratio:       {avg_nic * 100:.2f}%  (ReaLchords Offline MLE: 63.73%)"
+        f"NiC Ratio:       {avg_nic * 100:.2f}%"
     )
     logger.info(
-        f"Onset Interval EMD:        {emd * 1e3:.2f} ×10⁻³  (ReaLchords Offline MLE: 9.85)"
+        f"Onset Interval EMD:        {emd * 1e3:.2f} ×10⁻³"
     )
     logger.info(
-        f"Chord Length Entropy:      {pred_entropy:.2f}  (ref: {ref_entropy:.2f}, ReaLchords: 1.90)"
+        f"Chord Length Entropy:      {pred_entropy:.2f}  (ref: {ref_entropy:.2f})"
     )
     logger.info("=" * 60)
 

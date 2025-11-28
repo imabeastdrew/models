@@ -1,4 +1,4 @@
-"""ReaLchords-style evaluation metrics for melody-chord generation."""
+"""Evaluation metrics for generation."""
 
 from __future__ import annotations
 
@@ -49,23 +49,49 @@ def parse_chord_token(token: str) -> tuple[str | None, str | None]:
 def chord_pitch_classes(root: str, quality: str) -> set[int]:
     """Return set of pitch classes (0-11) for a chord.
 
-    `quality` is a numeric interval string like '0-4-7' produced by `ChordMapper`
-    in preprocessing.
+    ``quality`` is a numeric interval string produced by
+    :class:`scripts.preprocess.ChordMapper`, based on Hooktheory's
+    ``root_position_intervals``.
+
+    In our processed data this is typically a list of **successive intervals**
+    between chord tones (e.g. ``"4-3"`` for a major triad), but our tests also
+    exercise **absolute encodings** like ``"0-4-7"``. We therefore support
+    both encodings:
+
+    - Successive encoding (no explicit 0): e.g. ``"4-3"`` →
+      cumulative sums → offsets {0, 4, 7}.
+    - Absolute encoding (contains 0): e.g. ``"0-4-7"`` →
+      interpreted directly as offsets from the root.
     """
     try:
         root_pc = PITCH_CLASSES.index(root)
     except ValueError:
         return set()
 
-    # Parse interval string from preprocessing (e.g. '0-4-7').
     try:
-        intervals = {int(x) % 12 for x in quality.split("-")}
+        raw_intervals = [int(x) for x in quality.split("-") if x != ""]
     except ValueError:
         # Log and treat as "no valid chord" so metric frames are skipped.
         logger.warning("Unparseable chord quality %r for root %r", quality, root)
         return set()
 
-    return {(root_pc + i) % 12 for i in intervals}
+    if not raw_intervals:
+        return set()
+
+    # If an explicit 0 appears, interpret as absolute offsets (e.g. "0-4-7").
+    if any(i == 0 for i in raw_intervals):
+        rel_intervals = {i % 12 for i in raw_intervals}
+        rel_intervals.add(0)  # ensure root is included even if not listed
+    else:
+        # Successive-interval encoding (e.g. "4-3" for a major triad):
+        # take cumulative sums starting from 0.
+        rel_intervals = {0}
+        acc = 0
+        for step in raw_intervals:
+            acc = (acc + step) % 12
+            rel_intervals.add(acc)
+
+    return {(root_pc + interval) % 12 for interval in rel_intervals}
 
 
 def parse_melody_token(token: str) -> int | None:

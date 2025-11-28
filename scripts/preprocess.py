@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preprocess HookTheory JSON directly to numpy arrays."""
+"""HookTheory JSON to arrays."""
 
 import argparse
 import json
@@ -84,15 +84,14 @@ def process_dataset(config: DataConfig) -> None:
     chord_vocab = Vocabulary("chord", config)
     chord_mapper = ChordMapper()
 
-    # ==========================================
     # Pass 1: Build Vocabulary
-    # ==========================================
+
     logger.info("Pass 1: Building Vocabulary...")
     with open(config.data_raw, 'rb') as f:
         for _, data in tqdm(ijson.kvitems(f, ''), desc="Building Vocab"):
             annot = data.get('annotations', {})
 
-            # Augment the vocab by including all transpositions in [-max_transpose, max_transpose].
+            # Augment vocab by all transpositions in [-max_transpose, max_transpose].
             for transpose in range(-config.max_transpose, config.max_transpose + 1):
                 if annot.get('melody'):
                     for n in annot['melody']:
@@ -103,9 +102,17 @@ def process_dataset(config: DataConfig) -> None:
 
                 if annot.get('harmony'):
                     for c in annot['harmony']:
+                        # Some annotations may have empty or missing interval lists.
+                        # These would produce an empty chord "quality" string, which
+                        # later cannot be parsed by the evaluation metrics.
+                        intervals = c.get('root_position_intervals') or []
+                        if not intervals:
+                            # Treat these as "no chord" and skip them in the vocab.
+                            continue
+
                         tp_root = (c['root_pitch_class'] + transpose) % 12
                         token = chord_mapper.get_token(
-                            tp_root, c['root_position_intervals'], c['inversion']
+                            tp_root, intervals, c['inversion']
                         )
                         chord_vocab.add(f"{token}_on")
                         chord_vocab.add(f"{token}_hold")
@@ -113,9 +120,8 @@ def process_dataset(config: DataConfig) -> None:
     melody_vocab.save(config.vocab_melody)
     chord_vocab.save(config.vocab_chord)
 
-    # ==========================================
-    # Pass 2: Tokenize and Save to NPY
-    # ==========================================
+    # Pass 2: Tokenize and save to NPY
+
     logger.info("Pass 2: Tokenizing to Numpy...")
 
     buffers = defaultdict(lambda: {'src': [], 'tgt': []})
@@ -130,7 +136,6 @@ def process_dataset(config: DataConfig) -> None:
 
             total_frames = int(num_beats * config.frame_rate)
 
-            # No on-disk augmentation: we store sequences in their original key.
             # Random transposition in [-max_transpose, max_transpose] is applied
             # on-the-fly in the Dataset for the train split.
             transpose = 0
@@ -165,12 +170,18 @@ def process_dataset(config: DataConfig) -> None:
             # Harmony
             if annot.get('harmony'):
                 for c in annot['harmony']:
+                    # As in the vocab pass, skip chords with empty / missing interval
+                    # lists so we don't create unparseable chord qualities.
+                    intervals = c.get('root_position_intervals') or []
+                    if not intervals:
+                        continue
+
                     start = int(round(c['onset'] * config.frame_rate))
                     end = int(round(c['offset'] * config.frame_rate))
 
                     tp_root = (c['root_pitch_class'] + transpose) % 12
                     base_token = chord_mapper.get_token(
-                        tp_root, c['root_position_intervals'], c['inversion']
+                        tp_root, intervals, c['inversion']
                     )
                     token_on = f"{base_token}_on"
                     token_hold = f"{base_token}_hold"
