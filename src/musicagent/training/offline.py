@@ -322,7 +322,7 @@ def train_offline(args: argparse.Namespace) -> None:
                 json.dump(asdict(m_cfg), f, default=str, indent=2)
             logger.info("Saved data/model configs.")
 
-            if use_wandb:
+            if use_wandb and wandb.run is not None:
                 wandb.run.summary["best_val_loss"] = best_val_loss
                 try:
                     wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
