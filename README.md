@@ -12,10 +12,8 @@ uv sync
 ## Training Example
 
 ```bash
-# Offline (encoder–decoder, full‑melody context)
 musicagent-train-offline --epochs 20
 
-# Online (decoder‑only, interleaved melody/chord frames)
 musicagent-train-online --epochs 20
 ```
 
