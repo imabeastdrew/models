@@ -1,3 +1,5 @@
+"""Integration tests for training pipeline."""
+
 import json
 import sys
 from pathlib import Path
@@ -6,9 +8,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from musicagent.config import DataConfig, ModelConfig
-from musicagent.model import OfflineTransformer
-from musicagent.train import main
+from musicagent.config import DataConfig, OfflineConfig
+from musicagent.models import OfflineTransformer
+from musicagent.training.offline import main
 
 
 def _create_dummy_data(data_dir: Path, cfg: DataConfig):
@@ -56,9 +58,10 @@ def _create_dummy_data(data_dir: Path, cfg: DataConfig):
     np.save(data_dir / "valid_src.npy", src)
     np.save(data_dir / "valid_tgt.npy", tgt)
 
+
 def test_train_main_integration(tmp_path):
     """
-    End-to-end integration test for train.main().
+    End-to-end integration test for training.offline.main().
     Runs 1 epoch with minimal data to ensure no crashes.
     """
     # Setup dummy data
@@ -83,8 +86,8 @@ def test_train_main_integration(tmp_path):
         "--warmup-steps", "1"
     ]
 
-    # Patch DataConfig in train.py to return a config pointing to our tmp dir
-    with patch("musicagent.train.DataConfig") as mock_data_config:
+    # Patch DataConfig in training.offline to return a config pointing to our tmp dir
+    with patch("musicagent.training.offline.DataConfig") as mock_data_config:
         # Configure the mock instance to behave like a real DataConfig
         # but with our paths
         mock_cfg = DataConfig(data_processed=data_dir)
@@ -98,12 +101,13 @@ def test_train_main_integration(tmp_path):
     # Assertions
     assert (checkpoints_dir / "best_model.pt").exists()
 
+
 def test_checkpoint_save_load(tmp_path):
     """Verify that a model can be saved and loaded correctly."""
     checkpoint_path = tmp_path / "test_model.pt"
 
     d_cfg = DataConfig(max_len=16)
-    m_cfg = ModelConfig(d_model=32, n_heads=4, n_layers=2)
+    m_cfg = OfflineConfig(d_model=32, n_heads=4, n_layers=2)
     vocab_src = 10
     vocab_tgt = 10
 
@@ -120,4 +124,3 @@ def test_checkpoint_save_load(tmp_path):
     # Compare parameters
     for p1, p2 in zip(model.parameters(), loaded_model.parameters()):
         assert torch.equal(p1, p2)
-

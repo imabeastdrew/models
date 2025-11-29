@@ -1,4 +1,7 @@
+"""Script for online model."""
+
 import argparse
+import json
 import logging
 import math
 import time
@@ -12,15 +15,16 @@ import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from musicagent.config import DataConfig, ModelConfig
-from musicagent.dataset import MusicAgentDataset, collate_fn
-from musicagent.model import OfflineTransformer
+from musicagent.config import DataConfig, OnlineConfig
+from musicagent.data.online import OnlineDataset, make_online_collate_fn
+from musicagent.models import OnlineTransformer
 from musicagent.utils import seed_everything, setup_logging
 
 logger = logging.getLogger(__name__)
 
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+    """Create a linear learning rate schedule with warmup."""
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -33,6 +37,7 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
 
 def count_parameters(model: nn.Module) -> int:
+    """Count trainable parameters in a model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
@@ -48,29 +53,43 @@ def train_epoch(
     use_wandb: bool = True,
     log_interval: int = 100,
 ):
+    """Train for one epoch.
+
+    For the online model, the DataLoader yields interleaved sequences
+    ``[SOS, y₁, x₁, y₂, x₂, ...]`` from :class:`OnlineDataset`. We perform
+    next‑token prediction but only train on chord tokens ``y_t``; loss
+    contributions from melody tokens ``x_t`` are masked out.
+    """
     model.train()
     total_loss = 0.0
     start_time = time.time()
 
-    for i, batch in enumerate(loader):
-        # DataLoader + collate_fn returns a tuple (src_batch, tgt_batch).
-        # For robustness, also support a dict-style batch.
-        if isinstance(batch, tuple):
-            src, tgt = batch
-        else:
-            src = batch["src"]
-            tgt = batch["tgt"]
+    for i, input_ids in enumerate(loader):
+        input_ids = input_ids.to(device)
 
-        src = src.to(device)
-        tgt = tgt.to(device)
+        # Standard next-token prediction over the interleaved sequence:
+        #
+        #   full sequence: [SOS, y₁, x₁, ..., yₙ, xₙ]
+        #   inputs       = [SOS, y₁, x₁, ..., yₙ]       (drops last token)
+        #   targets      = [y₁,  x₁, y₂, ..., yₙ, xₙ]  (shifted left by 1)
+        #
+        inputs = input_ids[:, :-1]
+        targets = input_ids[:, 1:].clone()
 
-        tgt_input = tgt[:, :-1]
-        tgt_y = tgt[:, 1:]
+        # Mask out melody positions in the target so we only optimize chords.
+        # In `targets`, chord tokens live at even time indices (0, 2, 4, ...),
+        # and melody tokens at odd indices (1, 3, 5, ...).
+        pad_id = model.pad_id
+        targets[:, 1::2] = pad_id
 
         optimizer.zero_grad()
-        output = model(src, tgt_input)
+        output = model(inputs)
 
-        loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
+        # Flatten for loss computation
+        loss = criterion(
+            output.reshape(-1, output.size(-1)),
+            targets.reshape(-1)
+        )
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -107,44 +126,37 @@ def train_epoch(
 
 
 def evaluate(model, loader, criterion, device):
+    """Evaluate model on validation/test set.
+
+    Note:
+        The returned loss is the *mean of per-batch cross-entropies*, i.e.
+        effectively averaged per sample, not strictly normalized by the total
+        number of (non-ignored) tokens. This is sufficient for tracking
+        training progress but is not a calibrated per-token NLL.
+    """
     model.eval()
     total_loss = 0.0
     total_tokens = 0
 
     with torch.no_grad():
-        for batch in loader:
-            if isinstance(batch, tuple):
-                src, tgt = batch
-            else:
-                src = batch["src"]
-                tgt = batch["tgt"]
+        for input_ids in loader:
+            input_ids = input_ids.to(device)
 
-            src = src.to(device)
-            tgt = tgt.to(device)
+            inputs = input_ids[:, :-1]
+            targets = input_ids[:, 1:].clone()
 
-            tgt_input = tgt[:, :-1]
-            tgt_y = tgt[:, 1:]
+            # Apply the same chord-only masking used in training.
+            pad_id = model.pad_id
+            targets[:, 1::2] = pad_id
 
-            output = model(src, tgt_input)
+            output = model(inputs)
 
-            # Flatten for loss calculation
             flat_output = output.reshape(-1, output.size(-1))
-            flat_targets = tgt_y.reshape(-1)
+            flat_targets = targets.reshape(-1)
 
-            # Calculate loss (sum instead of mean to aggregate correctly)
             loss = criterion(flat_output, flat_targets)
 
-            # If criterion is reduction='mean' (default), we need to multiply by batch size
-            # or number of valid tokens if we want accurate weighted average.
-            # However, CrossEntropyLoss with ignore_index averages over non-ignored tokens.
-            # It's better to get the sum and divide by total non-ignored tokens manually if we
-            # want exactness, but a simpler improvement is to weight by batch size.
-            # Let's assume we want average per-batch for now but robust to last batch size.
-
-            # Better approach: use reduction='sum' in criterion if we could control it,
-            # but here it is passed in.
-            # Assuming default mean reduction:
-            batch_size = src.size(0)
+            batch_size = input_ids.size(0)
             total_loss += loss.item() * batch_size
             total_tokens += batch_size
 
@@ -154,64 +166,16 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total_tokens
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Train Offline Model")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"))
-    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--wandb-project", type=str, default="musicagent")
-    parser.add_argument("--run-name", type=str, default=None, help="Custom wandb run name")
-    parser.add_argument(
-        "--resume-from",
-        type=Path,
-        default=None,
-        help="Path to a model checkpoint (.pt) to warm-start from before training.",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Enable deterministic training (may be slower and restrict some CUDA kernels).",
-    )
-    # Data hyperparameters
-    parser.add_argument("--max-len", type=int, help="Maximum input length for the model.")
-    parser.add_argument(
-        "--storage-len",
-        type=int,
-        help="Sequence length used on disk (must be >= max-len).",
-    )
-    parser.add_argument(
-        "--max-transpose",
-        type=int,
-        help="Maximum semitone shift for random transposition augmentation.",
-    )
-    # Model / training hyperparameters
-    parser.add_argument("--d-model", type=int, help="Transformer model dimension.")
-    parser.add_argument("--n-heads", type=int, help="Number of attention heads.")
-    parser.add_argument("--n-layers", type=int, help="Number of Transformer layers.")
-    parser.add_argument("--dropout", type=float, help="Dropout rate.")
-    parser.add_argument("--batch-size", type=int, help="Training batch size.")
-    parser.add_argument("--lr", type=float, help="Learning rate.")
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        help="Number of warmup steps for the learning-rate scheduler.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        help="Device to run training on (cuda/cpu).",
-    )
-    args = parser.parse_args()
-
+def train_online(args: argparse.Namespace) -> None:
+    """Main training function for online model (MLE pretraining)."""
     setup_logging()
     seed_everything(args.seed, deterministic=args.deterministic)
-    args.save_dir.mkdir(exist_ok=True)
+    args.save_dir.mkdir(exist_ok=True, parents=True)
 
     d_cfg = DataConfig()
-    m_cfg = ModelConfig()
+    m_cfg = OnlineConfig()
 
-    # Apply CLI overrides to configs (only when explicitly provided).
+    # Apply CLI overrides
     if args.max_len is not None:
         d_cfg.max_len = args.max_len
     if args.storage_len is not None:
@@ -234,7 +198,7 @@ def main():
     if args.warmup_steps is not None:
         m_cfg.warmup_steps = args.warmup_steps
 
-    # Check for valid model configuration
+    # Validate configuration
     if m_cfg.d_model % m_cfg.n_heads != 0:
         raise ValueError(
             f"d_model ({m_cfg.d_model}) must be divisible by n_heads ({m_cfg.n_heads})"
@@ -247,12 +211,13 @@ def main():
     logger.info(f"Using device: {device}")
 
     try:
-        train_ds = MusicAgentDataset(d_cfg, split='train')
-        valid_ds = MusicAgentDataset(d_cfg, split='valid')
+        train_ds = OnlineDataset(d_cfg, split='train')
+        valid_ds = OnlineDataset(d_cfg, split='valid')
     except FileNotFoundError as e:
         logger.error(e)
         return
 
+    collate_fn = make_online_collate_fn(pad_id=d_cfg.pad_id)
     train_loader = DataLoader(
         train_ds,
         batch_size=m_cfg.batch_size,
@@ -265,15 +230,22 @@ def main():
         collate_fn=collate_fn,
     )
 
-    vocab_src_len = len(train_ds.vocab_melody)
-    vocab_tgt_len = len(train_ds.vocab_chord)
-    logger.info(f"Vocab Size: Src={vocab_src_len}, Tgt={vocab_tgt_len}")
+    # Get vocab sizes from dataset
+    melody_vocab_size = train_ds.melody_vocab_size
+    chord_vocab_size = train_ds.chord_vocab_size
+    unified_vocab_size = train_ds.unified_vocab_size
+    logger.info(
+        f"Vocab Size: Melody={melody_vocab_size}, Chord={chord_vocab_size}, "
+        f"Unified={unified_vocab_size}"
+    )
 
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src_len, vocab_tgt_len).to(device)
+    model = OnlineTransformer(
+        m_cfg, d_cfg, melody_vocab_size, chord_vocab_size
+    ).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
 
-    # Optionally warm-start from an existing checkpoint (e.g., best_model.pt).
+    # Optionally resume from checkpoint
     if args.resume_from is not None:
         if args.resume_from.is_file():
             state_dict = torch.load(args.resume_from, map_location=device)
@@ -286,44 +258,46 @@ def main():
             )
 
     optimizer = optim.AdamW(model.parameters(), lr=m_cfg.lr, weight_decay=0.01)
+
+    # Use unified vocab's pad_id for loss masking
+    # In the unified vocab, pad_id is the same as melody's pad_id (0)
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
 
+    # Calculate total steps from epochs
     total_steps = len(train_loader) * args.epochs
+
     scheduler = get_linear_schedule_with_warmup(optimizer, m_cfg.warmup_steps, total_steps)
 
     # Initialize wandb
     use_wandb = not args.no_wandb
     if use_wandb:
         run_name = args.run_name or (
-            f"d{m_cfg.d_model}_h{m_cfg.n_heads}_L{m_cfg.n_layers}_bs{m_cfg.batch_size}"
+            f"online_d{m_cfg.d_model}_h{m_cfg.n_heads}_L{m_cfg.n_layers}_bs{m_cfg.batch_size}"
         )
 
         wandb.init(
             project=args.wandb_project,
             name=run_name,
             config={
-                # Model config
+                "model_type": "online",
                 **asdict(m_cfg),
-                # Data config (excluding paths)
                 "max_len": d_cfg.max_len,
                 "frame_rate": d_cfg.frame_rate,
                 "storage_len": d_cfg.storage_len,
-                # Training args
                 "epochs": args.epochs,
                 "weight_decay": 0.01,
                 "grad_clip": 0.5,
-                # Derived
-                "vocab_src_size": vocab_src_len,
-                "vocab_tgt_size": vocab_tgt_len,
+                "melody_vocab_size": melody_vocab_size,
+                "chord_vocab_size": chord_vocab_size,
+                "unified_vocab_size": unified_vocab_size,
                 "total_params": total_params,
                 "train_samples": len(train_ds),
                 "valid_samples": len(valid_ds),
                 "total_steps": total_steps,
             },
-            tags=["transformer", "melody-chord", "realchords"],
+            tags=["transformer", "online", "melody-chord", "realchords"],
         )
 
-        # Define summary metrics
         wandb.define_metric("train/loss", summary="min")
         wandb.define_metric("valid/loss", summary="min")
         wandb.define_metric("valid/perplexity", summary="min")
@@ -337,7 +311,6 @@ def main():
             device, epoch, global_step, use_wandb
         )
         val_loss = evaluate(model, valid_loader, criterion, device)
-        # Clamp val_loss to avoid overflow in exp
         try:
             val_ppl = math.exp(min(val_loss, 100))
         except OverflowError:
@@ -363,8 +336,16 @@ def main():
             torch.save(model.state_dict(), checkpoint_path)
             logger.info("Saved best model.")
 
+            # Persist the effective data/model configs alongside the checkpoint
+            data_cfg_path = args.save_dir / "data_config.json"
+            model_cfg_path = args.save_dir / "model_config.json"
+            with data_cfg_path.open("w") as f:
+                json.dump(asdict(d_cfg), f, default=str, indent=2)
+            with model_cfg_path.open("w") as f:
+                json.dump(asdict(m_cfg), f, default=str, indent=2)
+            logger.info("Saved data/model configs.")
+
             if use_wandb:
-                # Update summary metrics.
                 wandb.run.summary["best_val_loss"] = best_val_loss
                 try:
                     wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
@@ -372,11 +353,11 @@ def main():
                     wandb.run.summary["best_val_perplexity"] = float('inf')
                 wandb.run.summary["best_epoch"] = epoch
 
-                # Log best-model checkpoint as a W&B artifact.
                 artifact = wandb.Artifact(
-                    name="best-model",
+                    name="best-online-model",
                     type="model",
                     metadata={
+                        "model_type": "online",
                         "epoch": epoch,
                         "val_loss": val_loss,
                         "val_perplexity": val_ppl,
@@ -387,6 +368,44 @@ def main():
 
     if use_wandb:
         wandb.finish()
+
+
+def main():
+    """CLI entry point for online training."""
+    parser = argparse.ArgumentParser(description="Train Online Model (MLE Pretraining)")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
+    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints/online"))
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="musicagent")
+    parser.add_argument("--run-name", type=str, default=None, help="Custom wandb run name")
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help="Path to a model checkpoint (.pt) to warm-start from.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic training.",
+    )
+    # Data hyperparameters
+    parser.add_argument("--max-len", type=int, help="Maximum input length.")
+    parser.add_argument("--storage-len", type=int, help="Sequence length on disk.")
+    parser.add_argument("--max-transpose", type=int, help="Max semitone shift.")
+    # Model / training hyperparameters
+    parser.add_argument("--d-model", type=int, help="Model dimension.")
+    parser.add_argument("--n-heads", type=int, help="Number of attention heads.")
+    parser.add_argument("--n-layers", type=int, help="Number of layers.")
+    parser.add_argument("--dropout", type=float, help="Dropout rate.")
+    parser.add_argument("--batch-size", type=int, help="Batch size.")
+    parser.add_argument("--lr", type=float, help="Learning rate.")
+    parser.add_argument("--warmup-steps", type=int, help="Warmup steps.")
+    parser.add_argument("--device", type=str, help="Device (cuda/cpu).")
+
+    args = parser.parse_args()
+    train_online(args)
 
 
 if __name__ == "__main__":

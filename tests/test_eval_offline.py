@@ -1,3 +1,5 @@
+"""Tests for offline evaluation module."""
+
 import json
 import sys
 from pathlib import Path
@@ -6,9 +8,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from musicagent.config import DataConfig, ModelConfig
+from musicagent.config import DataConfig, OfflineConfig
 from musicagent.eval import offline as eval_offline
-from musicagent.model import OfflineTransformer
+from musicagent.models import OfflineTransformer
 
 
 def _write_vocab(path: Path, token_to_id: dict[str, int]) -> None:
@@ -84,7 +86,7 @@ def test_offline_main_smoke(tmp_path) -> None:
 
     # Small configs for a lightweight test run.
     d_cfg = DataConfig(data_processed=data_dir, max_len=16, storage_len=32)
-    m_cfg = ModelConfig(
+    m_cfg = OfflineConfig(
         d_model=32,
         n_heads=4,
         n_layers=2,
@@ -116,7 +118,7 @@ def test_offline_main_smoke(tmp_path) -> None:
 
     with (
         patch("musicagent.eval.offline.DataConfig") as mock_data_config,
-        patch("musicagent.eval.offline.ModelConfig") as mock_model_config,
+        patch("musicagent.eval.offline.OfflineConfig") as mock_model_config,
         patch.object(sys, "argv", test_args),
     ):
         mock_data_config.return_value = d_cfg
@@ -125,5 +127,3 @@ def test_offline_main_smoke(tmp_path) -> None:
         # The test passes if main() runs without raising and
         # completes a full evaluation pass over the dummy test set.
         eval_offline.main()
-
-

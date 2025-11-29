@@ -1,30 +1,26 @@
-import math
+"""Offline transformer.
+
+The offline model sees the complete melody before generating chords.
+It uses a standard encoder-decoder transformer architecture.
+"""
 
 import torch
 import torch.nn as nn
 
-from musicagent.config import DataConfig, ModelConfig
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 5000):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.pe: torch.Tensor
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + self.pe[:, :x.size(1)]
+from musicagent.config import DataConfig, OfflineConfig
+from musicagent.models.components import PositionalEncoding
 
 
 class OfflineTransformer(nn.Module):
+    """Encoder-decoder transformer for offline chord generation.
+
+    Given a complete melody sequence, generates a chord sequence
+    autoregressively using teacher forcing during training.
+    """
+
     def __init__(
         self,
-        model_config: ModelConfig,
+        model_config: OfflineConfig,
         data_config: DataConfig,
         vocab_src_size: int,
         vocab_tgt_size: int
@@ -59,6 +55,15 @@ class OfflineTransformer(nn.Module):
         self.pad_id = data_config.pad_id
 
     def create_mask(self, src: torch.Tensor, tgt: torch.Tensor):
+        """Create attention masks for transformer.
+
+        Args:
+            src: Source tensor (batch, src_len)
+            tgt: Target tensor (batch, tgt_len)
+
+        Returns:
+            Tuple of (src_key_padding_mask, tgt_key_padding_mask, tgt_mask)
+        """
         src_key_padding_mask = (src == self.pad_id)
         tgt_key_padding_mask = (tgt == self.pad_id)
 
@@ -73,6 +78,15 @@ class OfflineTransformer(nn.Module):
         return src_key_padding_mask, tgt_key_padding_mask, tgt_mask
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        """Forward pass with teacher forcing.
+
+        Args:
+            src: Source melody tokens (batch, src_len)
+            tgt: Target chord tokens (batch, tgt_len)
+
+        Returns:
+            Logits over target vocabulary (batch, tgt_len, vocab_tgt_size)
+        """
         src_key_mask, tgt_key_mask, tgt_mask = self.create_mask(src, tgt)
 
         src_emb = self.pos_enc(self.src_embed(src))
@@ -165,3 +179,4 @@ class OfflineTransformer(nn.Module):
                 break
 
         return generated
+

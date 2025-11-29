@@ -1,7 +1,9 @@
+"""Tests for training utilities."""
+
 import torch.nn as nn
 import torch.optim as optim
 
-from musicagent.train import count_parameters, get_linear_schedule_with_warmup
+from musicagent.training.offline import count_parameters, get_linear_schedule_with_warmup
 
 
 def test_count_parameters() -> None:
@@ -88,4 +90,3 @@ def test_linear_schedule_reaches_zero() -> None:
         scheduler.step()
 
     assert scheduler.get_last_lr()[0] == 0.0
-

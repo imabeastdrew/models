@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.scripts]
-musicagent-train = "musicagent.train:main"
+musicagent-train-offline = "musicagent.training.offline:main"
+musicagent-train-online = "musicagent.training.online:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/musicagent"]
