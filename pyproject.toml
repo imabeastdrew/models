@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
+musicagent-train = "musicagent.training:main"
 musicagent-train-offline = "musicagent.training.offline:main"
 musicagent-train-online = "musicagent.training.online:main"
 
