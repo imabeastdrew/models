@@ -18,70 +18,13 @@ from musicagent.utils import setup_logging
 from .metrics import (
     chord_length_entropy,
     chord_lengths,
+    decode_tokens,
     note_in_chord_ratio,
     onset_interval_emd,
     onset_intervals,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def decode_tokens(ids: list[int], id_to_token: dict[int, str]) -> list[str]:
-    """Convert token IDs back to string tokens."""
-    return [id_to_token.get(i, "<unk>") for i in ids]
-
-
-def note_in_chord_at_beat(
-    melody_tokens: list[str],
-    chord_tokens: list[str],
-    frame_rate: int = 4,
-) -> dict[int, float]:
-    """Compute note-in-chord ratio at each beat position.
-
-    Used for analyzing adaptation dynamics over time.
-
-    Args:
-        melody_tokens: List of melody token strings
-        chord_tokens: List of chord token strings
-        frame_rate: Frames per beat (default 4 for 16th notes)
-
-    Returns:
-        Dictionary mapping beat index to NiC ratio at that beat
-    """
-    from .metrics import chord_pitch_classes, parse_chord_token, parse_melody_token
-
-    num_frames = min(len(melody_tokens), len(chord_tokens))
-    num_beats = num_frames // frame_rate
-
-    beat_nic = {}
-
-    for beat in range(num_beats):
-        start_frame = beat * frame_rate
-        end_frame = start_frame + frame_rate
-
-        matches = 0
-        total = 0
-
-        for t in range(start_frame, min(end_frame, num_frames)):
-            mel_tok = melody_tokens[t]
-            chd_tok = chord_tokens[t]
-
-            midi_pitch = parse_melody_token(mel_tok)
-            root, quality = parse_chord_token(chd_tok)
-
-            if midi_pitch is None or root is None or quality is None:
-                continue
-
-            melody_pc = midi_pitch % 12
-            chord_pcs = chord_pitch_classes(root, quality)
-
-            if melody_pc in chord_pcs:
-                matches += 1
-            total += 1
-
-        beat_nic[beat] = matches / total if total > 0 else 0.0
-
-    return beat_nic
 
 
 def perturb_melody(melody: torch.Tensor, semitones: int, start_frame: int) -> torch.Tensor:

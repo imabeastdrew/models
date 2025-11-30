@@ -20,17 +20,13 @@ from musicagent.utils import setup_logging
 from .metrics import (
     chord_length_entropy,
     chord_lengths,
+    decode_tokens,
     note_in_chord_ratio,
     onset_interval_emd,
     onset_intervals,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def decode_tokens(ids: list[int], id_to_token: dict[int, str]) -> list[str]:
-    """Convert token IDs back to string tokens."""
-    return [id_to_token.get(i, "<unk>") for i in ids]
 
 
 def main():
