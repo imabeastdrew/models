@@ -341,6 +341,8 @@ def train_offline(args: argparse.Namespace) -> None:
                     },
                 )
                 artifact.add_file(str(checkpoint_path))
+                artifact.add_file(str(data_cfg_path))
+                artifact.add_file(str(model_cfg_path))
                 wandb.log_artifact(artifact, aliases=["best", f"epoch-{epoch}"])
 
     if use_wandb:

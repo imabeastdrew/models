@@ -6,7 +6,9 @@ import argparse
 import json
 import logging
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -26,11 +28,162 @@ from .metrics import (
     onset_intervals,
 )
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OfflineEvalResult:
+    """Result container for offline model evaluation."""
+
+    # Loss metrics
+    test_loss: float = 0.0
+    test_perplexity: float = 0.0
+
+    # Generation metrics
+    nic_ratio: float = 0.0
+    nic_std: float = 0.0
+    onset_interval_emd: float = 0.0
+    pred_chord_length_entropy: float = 0.0
+    ref_chord_length_entropy: float = 0.0
+
+    # Raw data for further analysis
+    per_song_nic: list[float] = field(default_factory=list)
+    pred_intervals: list[int] = field(default_factory=list)
+    ref_intervals: list[int] = field(default_factory=list)
+    pred_lengths: list[int] = field(default_factory=list)
+    ref_lengths: list[int] = field(default_factory=list)
+
+    # Cached predictions: {idx: (mel_tokens, pred_tokens, ref_tokens)}
+    cached_predictions: dict[int, tuple[list[str], list[str], list[str]]] = field(
+        default_factory=dict
+    )
+
+    # Metadata
+    num_sequences: int = 0
+
+
+def evaluate_offline(
+    model: OfflineTransformer,
+    test_loader: DataLoader,
+    d_cfg: DataConfig,
+    id_to_melody: dict[int, str],
+    id_to_chord: dict[int, str],
+    device: torch.device,
+    temperature: float = 1.0,
+    sample: bool = False,
+    log_progress: bool = True,
+) -> OfflineEvalResult:
+    """Evaluate offline model and return metrics with cached predictions.
+
+    Args:
+        model: Trained OfflineTransformer model (already on device, in eval mode)
+        test_loader: DataLoader for test set (using OfflineDataset)
+        d_cfg: Data configuration
+        id_to_melody: Mapping from melody token IDs to strings
+        id_to_chord: Mapping from chord token IDs to strings
+        device: Device to run evaluation on
+        temperature: Sampling temperature (only used with sample=True)
+        sample: If True, sample from distribution; otherwise greedy decode
+        log_progress: If True, log progress to logger
+
+    Returns:
+        OfflineEvalResult containing all metrics and cached predictions
+    """
+    import numpy as np
+
+    result = OfflineEvalResult()
+
+    # --- 1. Test loss / perplexity (teacher-forced) ---
+    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
+    total_loss = 0.0
+    total_samples = 0
+
+    if log_progress:
+        logger.info("Computing teacher-forced test loss...")
+
+    with torch.no_grad():
+        for src, tgt in test_loader:
+            src, tgt = src.to(device), tgt.to(device)
+            tgt_input = tgt[:, :-1]
+            tgt_y = tgt[:, 1:]
+            output = model(src, tgt_input)
+            loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
+            total_loss += loss.item() * src.size(0)
+            total_samples += src.size(0)
+
+    result.test_loss = total_loss / total_samples if total_samples > 0 else 0.0
+    result.test_perplexity = math.exp(min(result.test_loss, 100))
+
+    if log_progress:
+        logger.info(f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}")
+
+    # --- 2. Generate chord sequences & compute metrics ---
+    if log_progress:
+        logger.info("Generating chord sequences for metric evaluation...")
+
+    num_batches = len(test_loader)
+    global_idx = 0
+
+    with torch.no_grad():
+        for batch_idx, (src, tgt) in enumerate(test_loader):
+            src = src.to(device)
+
+            pred = model.generate(
+                src,
+                max_len=d_cfg.max_len,
+                sos_id=d_cfg.sos_id,
+                eos_id=d_cfg.eos_id,
+                temperature=temperature,
+                sample=sample,
+            )
+
+            for i in range(src.size(0)):
+                mel_ids = src[i].cpu().tolist()
+                pred_ids = pred[i].cpu().tolist()
+                ref_ids = tgt[i].cpu().tolist()
+
+                mel_tokens = decode_tokens(mel_ids, id_to_melody)
+                pred_tokens = decode_tokens(pred_ids, id_to_chord)
+                ref_tokens = decode_tokens(ref_ids, id_to_chord)
+
+                # Cache predictions
+                result.cached_predictions[global_idx] = (mel_tokens, pred_tokens, ref_tokens)
+
+                # Note-in-chord ratio
+                nic = note_in_chord_ratio(mel_tokens, pred_tokens)
+                result.per_song_nic.append(nic)
+
+                # Onset intervals
+                result.pred_intervals.extend(onset_intervals(mel_tokens, pred_tokens))
+                result.ref_intervals.extend(onset_intervals(mel_tokens, ref_tokens))
+
+                # Chord lengths
+                result.pred_lengths.extend(chord_lengths(pred_tokens))
+                result.ref_lengths.extend(chord_lengths(ref_tokens))
+
+                global_idx += 1
+
+            if log_progress and ((batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1):
+                logger.info(f"  Processed {batch_idx + 1}/{num_batches} batches")
+
+    # Compute aggregate metrics
+    result.nic_ratio = float(np.mean(result.per_song_nic)) if result.per_song_nic else 0.0
+    result.nic_std = float(np.std(result.per_song_nic)) if result.per_song_nic else 0.0
+    result.onset_interval_emd = onset_interval_emd(result.pred_intervals, result.ref_intervals)
+    result.pred_chord_length_entropy = chord_length_entropy(result.pred_lengths)
+    result.ref_chord_length_entropy = chord_length_entropy(result.ref_lengths)
+    result.num_sequences = len(result.per_song_nic)
+
+    return result
 
 
 def main():
     """Evaluate offline model on test set."""
+    from musicagent.utils import load_configs_from_dir
+
     parser = argparse.ArgumentParser(description="Evaluate Offline Model")
     parser.add_argument(
         "--checkpoint",
@@ -55,32 +208,16 @@ def main():
 
     setup_logging()
 
-    # Attempt to load saved configs from the checkpoint directory to avoid
-    # silent drift between training and evaluation settings. If no configs
-    # are found, fall back to default constructors.
+    # Load configs from checkpoint directory
     cfg_dir = args.checkpoint.parent
     data_cfg_path = cfg_dir / "data_config.json"
     model_cfg_path = cfg_dir / "model_config.json"
 
-    if data_cfg_path.exists():
-        with data_cfg_path.open() as f:
-            data_dict = json.load(f)
-        # Coerce path-like fields back to Path objects.
-        if "data_raw" in data_dict:
-            data_dict["data_raw"] = Path(data_dict["data_raw"])
-        if "data_processed" in data_dict:
-            data_dict["data_processed"] = Path(data_dict["data_processed"])
-        d_cfg = DataConfig(**data_dict)
-        logger.info(f"Loaded data config from {data_cfg_path}")
+    if data_cfg_path.exists() and model_cfg_path.exists():
+        d_cfg, m_cfg = load_configs_from_dir(cfg_dir, OfflineConfig)
+        logger.info(f"Loaded configs from {cfg_dir}")
     else:
         d_cfg = DataConfig()
-
-    if model_cfg_path.exists():
-        with model_cfg_path.open() as f:
-            model_dict = json.load(f)
-        m_cfg = OfflineConfig(**model_dict)
-        logger.info(f"Loaded model config from {model_cfg_path}")
-    else:
         m_cfg = OfflineConfig()
 
     if args.device:
@@ -111,86 +248,28 @@ def main():
     model.eval()
     logger.info(f"Loaded checkpoint from {args.checkpoint}")
 
-    # --- 1. Test loss / perplexity (teacher-forced) ---
-    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
-    total_loss = 0.0
-    total_samples = 0
+    # Run evaluation
+    result = evaluate_offline(
+        model=model,
+        test_loader=test_loader,
+        d_cfg=d_cfg,
+        id_to_melody=id_to_melody,
+        id_to_chord=id_to_chord,
+        device=device,
+        temperature=args.temperature,
+        sample=args.sample,
+    )
 
-    logger.info("Computing teacher-forced test loss...")
-    with torch.no_grad():
-        for src, tgt in test_loader:
-            src, tgt = src.to(device), tgt.to(device)
-            tgt_input = tgt[:, :-1]
-            tgt_y = tgt[:, 1:]
-            output = model(src, tgt_input)
-            loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
-            total_loss += loss.item() * src.size(0)
-            total_samples += src.size(0)
-
-    test_loss = total_loss / total_samples
-    test_ppl = math.exp(min(test_loss, 100))
-    logger.info(f"Test Loss: {test_loss:.4f} | Test Perplexity: {test_ppl:.2f}")
-
-    # --- 2. Generate chord sequences & compute metrics ---
-    logger.info("Generating chord sequences for metric evaluation...")
-    all_nic: list[float] = []
-    all_pred_intervals: list[int] = []
-    all_ref_intervals: list[int] = []
-    all_pred_lengths: list[int] = []
-    all_ref_lengths: list[int] = []
-
-    num_batches = len(test_loader)
-    with torch.no_grad():
-        for batch_idx, (src, tgt) in enumerate(test_loader):
-            src = src.to(device)
-            # Generate predictions
-            pred = model.generate(
-                src,
-                max_len=d_cfg.max_len,
-                sos_id=d_cfg.sos_id,
-                eos_id=d_cfg.eos_id,
-                temperature=args.temperature,
-                sample=args.sample,
-            )
-
-            for i in range(src.size(0)):
-                mel_ids = src[i].cpu().tolist()
-                pred_ids = pred[i].cpu().tolist()
-                ref_ids = tgt[i].cpu().tolist()
-
-                mel_tokens = decode_tokens(mel_ids, id_to_melody)
-                pred_tokens = decode_tokens(pred_ids, id_to_chord)
-                ref_tokens = decode_tokens(ref_ids, id_to_chord)
-
-                # Note-in-chord
-                nic = note_in_chord_ratio(mel_tokens, pred_tokens)
-                all_nic.append(nic)
-
-                # Onset intervals
-                all_pred_intervals.extend(onset_intervals(mel_tokens, pred_tokens))
-                all_ref_intervals.extend(onset_intervals(mel_tokens, ref_tokens))
-
-                # Chord lengths
-                all_pred_lengths.extend(chord_lengths(pred_tokens))
-                all_ref_lengths.extend(chord_lengths(ref_tokens))
-
-            if (batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1:
-                logger.info(f"  Processed {batch_idx + 1}/{num_batches} batches")
-
-    avg_nic = sum(all_nic) / len(all_nic) if all_nic else 0.0
-    emd = onset_interval_emd(all_pred_intervals, all_ref_intervals)
-    pred_entropy = chord_length_entropy(all_pred_lengths)
-    ref_entropy = chord_length_entropy(all_ref_lengths)
-
+    # Log results
     logger.info("=" * 60)
     logger.info("Metrics (Offline Eval)")
     logger.info("=" * 60)
-    logger.info(f"Test Loss:                 {test_loss:.4f}")
-    logger.info(f"Test Perplexity:           {test_ppl:.2f}")
+    logger.info(f"Test Loss:                 {result.test_loss:.4f}")
+    logger.info(f"Test Perplexity:           {result.test_perplexity:.2f}")
     logger.info("-" * 60)
-    logger.info(f"NiC Ratio:                 {avg_nic * 100:.2f}%")
-    logger.info(f"Onset Interval EMD:        {emd * 1e3:.2f} ×10⁻³")
-    logger.info(f"Chord Length Entropy:      {pred_entropy:.2f}  (ref: {ref_entropy:.2f})")
+    logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}%")
+    logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
+    logger.info(f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  (ref: {result.ref_chord_length_entropy:.2f})")
     logger.info("=" * 60)
 
 

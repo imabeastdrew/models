@@ -1,4 +1,4 @@
-"""Test set evaluation for offline model."""
+"""Test set evaluation for online model."""
 
 from __future__ import annotations
 
@@ -6,36 +6,263 @@ import argparse
 import json
 import logging
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from musicagent.config import DataConfig, OfflineConfig
-from musicagent.data import OfflineDataset, make_offline_collate_fn
-from musicagent.models import OfflineTransformer
+from musicagent.config import DataConfig, OnlineConfig
+from musicagent.data import OnlineDataset, make_online_collate_fn
+from musicagent.models import OnlineTransformer
 from musicagent.utils import setup_logging
 
 from .metrics import (
     chord_length_entropy,
     chord_lengths,
     decode_tokens,
-    note_in_chord_counts,
+    note_in_chord_ratio,
     onset_interval_emd,
     onset_intervals,
 )
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class OnlineEvalResult:
+    """Result container for online model evaluation."""
+
+    # Loss metrics
+    test_loss: float = 0.0
+    test_perplexity: float = 0.0
+
+    # Generation metrics
+    nic_ratio: float = 0.0
+    nic_std: float = 0.0
+    onset_interval_emd: float = 0.0
+    pred_chord_length_entropy: float = 0.0
+    ref_chord_length_entropy: float = 0.0
+
+    # Raw data for further analysis
+    per_song_nic: list[float] = field(default_factory=list)
+    pred_intervals: list[int] = field(default_factory=list)
+    ref_intervals: list[int] = field(default_factory=list)
+    pred_lengths: list[int] = field(default_factory=list)
+    ref_lengths: list[int] = field(default_factory=list)
+
+    # Cached predictions: {idx: (mel_tokens, pred_tokens, ref_tokens)}
+    cached_predictions: dict[int, tuple[list[str], list[str], list[str]]] = field(
+        default_factory=dict
+    )
+
+    # Metadata
+    num_sequences: int = 0
+
+
+def extract_melody_and_chords(
+    interleaved: torch.Tensor,
+    melody_vocab_size: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract melody frames and reference chord frames from interleaved sequence.
+
+    OnlineDataset format: [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
+    - Position 0: SOS (chord token in unified space)
+    - Odd positions (1, 3, 5, ...): chord tokens (unified space)
+    - Even positions (2, 4, 6, ...): melody tokens (melody space)
+
+    Args:
+        interleaved: Interleaved sequence tensor
+        melody_vocab_size: Size of melody vocabulary (chord offset)
+        pad_id: Padding token ID
+
+    Returns:
+        melody_frames: Tensor of melody token IDs (melody vocab space)
+        ref_chord_frames: Tensor of chord token IDs (chord vocab space, offset removed)
+    """
+    # Skip SOS at position 0
+    seq = interleaved[1:]  # Now: [y₁, x₁, y₂, x₂, ...]
+
+    # Extract chord and melody by alternating positions
+    chord_unified = seq[0::2]  # positions 0, 2, 4, ... -> y₁, y₂, y₃, ...
+    melody = seq[1::2]         # positions 1, 3, 5, ... -> x₁, x₂, x₃, ...
+
+    # Find valid length (non-PAD in melody)
+    pad_mask = (melody == pad_id)
+    if pad_mask.any():
+        valid_len = int(pad_mask.nonzero(as_tuple=True)[0][0].item())
+    else:
+        valid_len = len(melody)
+
+    melody_frames = melody[:valid_len]
+    chord_unified_frames = chord_unified[:valid_len]
+
+    # Convert chord tokens from unified space to chord vocab space
+    # Unified chord ID = chord_id + melody_vocab_size (except PAD stays 0)
+    ref_chord_frames = torch.where(
+        chord_unified_frames == pad_id,
+        chord_unified_frames,
+        chord_unified_frames - melody_vocab_size,
+    )
+
+    return melody_frames, ref_chord_frames
+
+
+def evaluate_online(
+    model: OnlineTransformer,
+    test_loader: DataLoader,
+    d_cfg: DataConfig,
+    id_to_melody: dict[int, str],
+    id_to_chord: dict[int, str],
+    melody_vocab_size: int,
+    device: torch.device,
+    temperature: float = 1.0,
+    sample: bool = False,
+    log_progress: bool = True,
+) -> OnlineEvalResult:
+    """Evaluate online model and return metrics with cached predictions.
+
+    Args:
+        model: Trained OnlineTransformer model (already on device, in eval mode)
+        test_loader: DataLoader for test set (using OnlineDataset)
+        d_cfg: Data configuration
+        id_to_melody: Mapping from melody token IDs to strings
+        id_to_chord: Mapping from chord token IDs to strings
+        melody_vocab_size: Size of melody vocabulary (for unified->chord conversion)
+        device: Device to run evaluation on
+        temperature: Sampling temperature (only used with sample=True)
+        sample: If True, sample from distribution; otherwise greedy decode
+        log_progress: If True, log progress to logger
+
+    Returns:
+        OnlineEvalResult containing all metrics and cached predictions
+    """
+    import numpy as np
+
+    result = OnlineEvalResult()
+
+    # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---
+    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, reduction="sum")
+    total_loss = 0.0
+    total_chord_tokens = 0
+
+    if log_progress:
+        logger.info("Computing teacher-forced test loss (chord positions only)...")
+
+    with torch.no_grad():
+        for interleaved_batch in test_loader:
+            interleaved_batch = interleaved_batch.to(device)
+
+            input_ids = interleaved_batch[:, :-1]
+            target_ids = interleaved_batch[:, 1:]
+
+            logits = model(input_ids)
+
+            batch_size, seq_len = target_ids.shape
+            chord_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+            chord_mask[0::2] = True
+
+            chord_logits = logits[:, chord_mask, :]
+            chord_targets = target_ids[:, chord_mask]
+
+            loss = criterion(
+                chord_logits.reshape(-1, chord_logits.size(-1)),
+                chord_targets.reshape(-1),
+            )
+
+            non_pad_mask = chord_targets != d_cfg.pad_id
+            num_chord_tokens = non_pad_mask.sum().item()
+
+            total_loss += loss.item()
+            total_chord_tokens += num_chord_tokens
+
+    result.test_loss = total_loss / total_chord_tokens if total_chord_tokens > 0 else 0.0
+    result.test_perplexity = math.exp(min(result.test_loss, 100))
+
+    if log_progress:
+        logger.info(f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}")
+
+    # --- 2. Generate chord sequences & compute metrics ---
+    if log_progress:
+        logger.info("Generating chord sequences for metric evaluation...")
+
+    num_batches = len(test_loader)
+    global_idx = 0
+
+    with torch.no_grad():
+        for batch_idx, interleaved_batch in enumerate(test_loader):
+            interleaved_batch = interleaved_batch.to(device)
+            batch_size = interleaved_batch.size(0)
+
+            for i in range(batch_size):
+                interleaved = interleaved_batch[i]
+
+                melody_frames, ref_chord_frames = extract_melody_and_chords(
+                    interleaved, melody_vocab_size, d_cfg.pad_id
+                )
+
+                if len(melody_frames) == 0:
+                    global_idx += 1
+                    continue
+
+                pred_chords = model.generate(
+                    melody_frames.unsqueeze(0),
+                    sos_id=d_cfg.sos_id,
+                    eos_id=d_cfg.eos_id,
+                    temperature=temperature,
+                    sample=sample,
+                )[0]
+
+                mel_tokens = decode_tokens(melody_frames.cpu().tolist(), id_to_melody)
+                pred_tokens = decode_tokens(pred_chords.cpu().tolist(), id_to_chord)
+                ref_tokens = decode_tokens(ref_chord_frames.cpu().tolist(), id_to_chord)
+
+                # Cache predictions
+                result.cached_predictions[global_idx] = (mel_tokens, pred_tokens, ref_tokens)
+
+                # Note-in-chord ratio
+                nic = note_in_chord_ratio(mel_tokens, pred_tokens)
+                result.per_song_nic.append(nic)
+
+                # Onset intervals
+                result.pred_intervals.extend(onset_intervals(mel_tokens, pred_tokens))
+                result.ref_intervals.extend(onset_intervals(mel_tokens, ref_tokens))
+
+                # Chord lengths
+                result.pred_lengths.extend(chord_lengths(pred_tokens))
+                result.ref_lengths.extend(chord_lengths(ref_tokens))
+
+                global_idx += 1
+
+            if log_progress and ((batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1):
+                logger.info(f"  Processed {batch_idx + 1}/{num_batches} batches")
+
+    # Compute aggregate metrics
+    result.nic_ratio = float(np.mean(result.per_song_nic)) if result.per_song_nic else 0.0
+    result.nic_std = float(np.std(result.per_song_nic)) if result.per_song_nic else 0.0
+    result.onset_interval_emd = onset_interval_emd(result.pred_intervals, result.ref_intervals)
+    result.pred_chord_length_entropy = chord_length_entropy(result.pred_lengths)
+    result.ref_chord_length_entropy = chord_length_entropy(result.ref_lengths)
+    result.num_sequences = len(result.per_song_nic)
+
+    return result
+
+
 def main():
-    """Evaluate offline model on test set."""
-    parser = argparse.ArgumentParser(description="Evaluate Offline Model")
+    """Evaluate online model on test set."""
+    from musicagent.utils import load_configs_from_dir
+
+    parser = argparse.ArgumentParser(description="Evaluate Online Model")
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=Path("checkpoints/offline/best_model.pt"),
+        default=Path("checkpoints/online/best_model.pt"),
         help="Path to model checkpoint",
     )
     parser.add_argument("--batch-size", type=int, default=32)
@@ -55,41 +282,25 @@ def main():
 
     setup_logging()
 
-    # Attempt to load saved configs from the checkpoint directory to avoid
-    # silent drift between training and evaluation settings. If no configs
-    # are found, fall back to default constructors.
+    # Load configs from checkpoint directory
     cfg_dir = args.checkpoint.parent
     data_cfg_path = cfg_dir / "data_config.json"
     model_cfg_path = cfg_dir / "model_config.json"
 
-    if data_cfg_path.exists():
-        with data_cfg_path.open() as f:
-            data_dict = json.load(f)
-        # Coerce path-like fields back to Path objects.
-        if "data_raw" in data_dict:
-            data_dict["data_raw"] = Path(data_dict["data_raw"])
-        if "data_processed" in data_dict:
-            data_dict["data_processed"] = Path(data_dict["data_processed"])
-        d_cfg = DataConfig(**data_dict)
-        logger.info(f"Loaded data config from {data_cfg_path}")
+    if data_cfg_path.exists() and model_cfg_path.exists():
+        d_cfg, m_cfg = load_configs_from_dir(cfg_dir, OnlineConfig)
+        logger.info(f"Loaded configs from {cfg_dir}")
     else:
         d_cfg = DataConfig()
-
-    if model_cfg_path.exists():
-        with model_cfg_path.open() as f:
-            model_dict = json.load(f)
-        m_cfg = OfflineConfig(**model_dict)
-        logger.info(f"Loaded model config from {model_cfg_path}")
-    else:
-        m_cfg = OfflineConfig()
+        m_cfg = OnlineConfig()
 
     if args.device:
         m_cfg.device = args.device
     device = torch.device(m_cfg.device)
 
     # Load test dataset
-    test_ds = OfflineDataset(d_cfg, split="test")
-    collate = make_offline_collate_fn(pad_id=d_cfg.pad_id)
+    test_ds = OnlineDataset(d_cfg, split="test")
+    collate = make_online_collate_fn(pad_id=d_cfg.pad_id)
     test_loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
@@ -100,100 +311,40 @@ def main():
     # Build reverse vocab mappings
     id_to_melody = {v: k for k, v in test_ds.vocab_melody.items()}
     id_to_chord = {v: k for k, v in test_ds.vocab_chord.items()}
+    melody_vocab_size = test_ds.melody_vocab_size
+    chord_vocab_size = test_ds.chord_vocab_size
 
     # Load model
-    vocab_src = len(test_ds.vocab_melody)
-    vocab_tgt = len(test_ds.vocab_chord)
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src, vocab_tgt).to(device)
+    model = OnlineTransformer(m_cfg, d_cfg, melody_vocab_size, chord_vocab_size).to(device)
     model.load_state_dict(
         torch.load(args.checkpoint, map_location=device, weights_only=True)
     )
     model.eval()
     logger.info(f"Loaded checkpoint from {args.checkpoint}")
 
-    # --- 1. Test loss / perplexity (teacher-forced) ---
-    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
-    total_loss = 0.0
-    total_samples = 0
+    # Run evaluation
+    result = evaluate_online(
+        model=model,
+        test_loader=test_loader,
+        d_cfg=d_cfg,
+        id_to_melody=id_to_melody,
+        id_to_chord=id_to_chord,
+        melody_vocab_size=melody_vocab_size,
+        device=device,
+        temperature=args.temperature,
+        sample=args.sample,
+    )
 
-    logger.info("Computing teacher-forced test loss...")
-    with torch.no_grad():
-        for src, tgt in test_loader:
-            src, tgt = src.to(device), tgt.to(device)
-            tgt_input = tgt[:, :-1]
-            tgt_y = tgt[:, 1:]
-            output = model(src, tgt_input)
-            loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
-            total_loss += loss.item() * src.size(0)
-            total_samples += src.size(0)
-
-    test_loss = total_loss / total_samples
-    test_ppl = math.exp(min(test_loss, 100))
-    logger.info(f"Test Loss: {test_loss:.4f} | Test Perplexity: {test_ppl:.2f}")
-
-    # --- 2. Generate chord sequences & compute metrics ---
-    logger.info("Generating chord sequences for metric evaluation...")
-    # Frame-weighted NiC: accumulate (matches, total) across all sequences
-    total_nic_matches = 0
-    total_nic_frames = 0
-    all_pred_intervals: list[int] = []
-    all_ref_intervals: list[int] = []
-    all_pred_lengths: list[int] = []
-    all_ref_lengths: list[int] = []
-
-    num_batches = len(test_loader)
-    with torch.no_grad():
-        for batch_idx, (src, tgt) in enumerate(test_loader):
-            src = src.to(device)
-            # Generate predictions
-            pred = model.generate(
-                src,
-                max_len=d_cfg.max_len,
-                sos_id=d_cfg.sos_id,
-                eos_id=d_cfg.eos_id,
-                temperature=args.temperature,
-                sample=args.sample,
-            )
-
-            for i in range(src.size(0)):
-                mel_ids = src[i].cpu().tolist()
-                pred_ids = pred[i].cpu().tolist()
-                ref_ids = tgt[i].cpu().tolist()
-
-                mel_tokens = decode_tokens(mel_ids, id_to_melody)
-                pred_tokens = decode_tokens(pred_ids, id_to_chord)
-                ref_tokens = decode_tokens(ref_ids, id_to_chord)
-
-                # Note-in-chord (frame-weighted)
-                matches, total = note_in_chord_counts(mel_tokens, pred_tokens)
-                total_nic_matches += matches
-                total_nic_frames += total
-
-                # Onset intervals
-                all_pred_intervals.extend(onset_intervals(mel_tokens, pred_tokens))
-                all_ref_intervals.extend(onset_intervals(mel_tokens, ref_tokens))
-
-                # Chord lengths
-                all_pred_lengths.extend(chord_lengths(pred_tokens))
-                all_ref_lengths.extend(chord_lengths(ref_tokens))
-
-            if (batch_idx + 1) % 10 == 0 or batch_idx == num_batches - 1:
-                logger.info(f"  Processed {batch_idx + 1}/{num_batches} batches")
-
-    avg_nic = total_nic_matches / total_nic_frames if total_nic_frames > 0 else 0.0
-    emd = onset_interval_emd(all_pred_intervals, all_ref_intervals)
-    pred_entropy = chord_length_entropy(all_pred_lengths)
-    ref_entropy = chord_length_entropy(all_ref_lengths)
-
+    # Log results
     logger.info("=" * 60)
-    logger.info("Metrics (Offline Eval)")
+    logger.info("Metrics (Online Eval)")
     logger.info("=" * 60)
-    logger.info(f"Test Loss:                 {test_loss:.4f}")
-    logger.info(f"Test Perplexity:           {test_ppl:.2f}")
+    logger.info(f"Test Loss:                 {result.test_loss:.4f}")
+    logger.info(f"Test Perplexity:           {result.test_perplexity:.2f}")
     logger.info("-" * 60)
-    logger.info(f"NiC Ratio:                 {avg_nic * 100:.2f}%")
-    logger.info(f"Onset Interval EMD:        {emd * 1e3:.2f} ×10⁻³")
-    logger.info(f"Chord Length Entropy:      {pred_entropy:.2f}  (ref: {ref_entropy:.2f})")
+    logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}%")
+    logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
+    logger.info(f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  (ref: {result.ref_chord_length_entropy:.2f})")
     logger.info("=" * 60)
 
 
