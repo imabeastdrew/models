@@ -106,8 +106,8 @@ class OnlineDataset(BaseDataset):
         Other tokens are offset by melody_vocab_size.
         """
         if token_id == self.config.pad_id:
-            return self.config.pad_id
-        return token_id + self.melody_vocab_size
+            return int(self.config.pad_id)
+        return int(token_id + self.melody_vocab_size)
 
     def _interleave(
         self,

@@ -152,8 +152,8 @@ class OnlineTransformer(nn.Module):
         Special handling for PAD: map chord pad to unified pad (0).
         """
         if token_id == self.pad_id:
-            return self.pad_id
-        return token_id + self.melody_vocab_size
+            return int(self.pad_id)
+        return int(token_id + self.melody_vocab_size)
 
     @torch.no_grad()
     def generate(
