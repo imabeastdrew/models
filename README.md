@@ -19,14 +19,12 @@ musicagent-train-online --epochs 20
 
 ## CLI
 
-After installation, the following CLIs are available:
-
 ```bash
 musicagent-train-offline --help
 musicagent-train-online --help
 ```
 
-For running modules directly without installing as a package:
+Without package:
 
 ```bash
 python -m musicagent.training.offline --help
