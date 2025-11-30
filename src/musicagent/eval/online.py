@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -94,11 +93,9 @@ def extract_melody_and_chords(
     melody = seq[1::2]         # positions 1, 3, 5, ... -> x₁, x₂, x₃, ...
 
     # Find valid length (non-PAD in melody)
-    pad_mask = (melody == pad_id)
-    if pad_mask.any():
-        valid_len = int(pad_mask.nonzero(as_tuple=True)[0][0].item())
-    else:
-        valid_len = len(melody)
+    pad_mask = melody == pad_id
+    first_pad = pad_mask.nonzero(as_tuple=True)[0]
+    valid_len = int(first_pad[0].item()) if len(first_pad) > 0 else len(melody)
 
     melody_frames = melody[:valid_len]
     chord_unified_frames = chord_unified[:valid_len]
@@ -186,7 +183,9 @@ def evaluate_online(
     result.test_perplexity = math.exp(min(result.test_loss, 100))
 
     if log_progress:
-        logger.info(f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}")
+        logger.info(
+            f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}"
+        )
 
     # --- 2. Generate chord sequences & compute metrics ---
     if log_progress:
@@ -344,7 +343,10 @@ def main():
     logger.info("-" * 60)
     logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}%")
     logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
-    logger.info(f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  (ref: {result.ref_chord_length_entropy:.2f})")
+    logger.info(
+        f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  "
+        f"(ref: {result.ref_chord_length_entropy:.2f})"
+    )
     logger.info("=" * 60)
 
 

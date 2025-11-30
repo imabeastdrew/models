@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
 from dataclasses import dataclass, field
@@ -118,7 +117,9 @@ def evaluate_offline(
     result.test_perplexity = math.exp(min(result.test_loss, 100))
 
     if log_progress:
-        logger.info(f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}")
+        logger.info(
+            f"Test Loss: {result.test_loss:.4f} | Test Perplexity: {result.test_perplexity:.2f}"
+        )
 
     # --- 2. Generate chord sequences & compute metrics ---
     if log_progress:
@@ -269,7 +270,10 @@ def main():
     logger.info("-" * 60)
     logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}%")
     logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
-    logger.info(f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  (ref: {result.ref_chord_length_entropy:.2f})")
+    logger.info(
+        f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  "
+        f"(ref: {result.ref_chord_length_entropy:.2f})"
+    )
     logger.info("=" * 60)
 
 
