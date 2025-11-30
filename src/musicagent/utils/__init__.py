@@ -11,6 +11,12 @@ from .loaders import (
     load_model_from_artifact,
 )
 from .registry import ModelConfigT, ModelRegistry, ModelType, get_model_registry
+from .visualization import (
+    format_tokens_for_display,
+    get_examples_by_nic_quality,
+    show_example,
+    show_examples_by_quality,
+)
 
 __all__ = [
     # Core
@@ -34,5 +40,10 @@ __all__ = [
     # Analysis
     "AdaptationDynamicsResult",
     "compute_adaptation_dynamics",
+    # Visualization
+    "format_tokens_for_display",
+    "show_example",
+    "get_examples_by_nic_quality",
+    "show_examples_by_quality",
 ]
 
