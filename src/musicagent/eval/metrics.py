@@ -112,12 +112,13 @@ def parse_melody_token(token: str) -> int | None:
 # Metric 1: Note-in-Chord Ratio
 # ---------------------------------------------------------------------------
 
-def note_in_chord_ratio(
+def note_in_chord_counts(
     melody_tokens: Sequence[str],
     chord_tokens: Sequence[str],
-) -> float:
-    """Compute fraction of frames where melody pitch class is in chord.
+) -> tuple[int, int]:
+    """Count frames where melody pitch class is in chord.
 
+    Returns (matches, total) for frame-weighted aggregation across sequences.
     Skips frames where either melody or chord is silent/special.
     """
     matches = 0
@@ -138,6 +139,18 @@ def note_in_chord_ratio(
             matches += 1
         total += 1
 
+    return matches, total
+
+
+def note_in_chord_ratio(
+    melody_tokens: Sequence[str],
+    chord_tokens: Sequence[str],
+) -> float:
+    """Compute fraction of frames where melody pitch class is in chord.
+
+    Skips frames where either melody or chord is silent/special.
+    """
+    matches, total = note_in_chord_counts(melody_tokens, chord_tokens)
     return matches / total if total > 0 else 0.0
 
 
@@ -268,10 +281,15 @@ def note_in_chord_at_beat(
     melody_tokens: Sequence[str],
     chord_tokens: Sequence[str],
     frame_rate: int = 4,
-) -> dict[int, float]:
+) -> dict[int, float | None]:
     """Compute note-in-chord ratio at each beat position.
 
     Used for analyzing adaptation dynamics over time (Figure 4 in ReaLchords).
+
+    Per the paper (Section K): "when averaging across songs, we exclude the
+    song where the whole beat is silence." This function returns None for
+    beats with no valid melody+chord frames, allowing callers to exclude
+    them from aggregation.
 
     Args:
         melody_tokens: List of melody token strings
@@ -279,12 +297,13 @@ def note_in_chord_at_beat(
         frame_rate: Frames per beat (default 4 for 16th notes)
 
     Returns:
-        Dictionary mapping beat index to NiC ratio at that beat
+        Dictionary mapping beat index to NiC ratio at that beat,
+        or None if the beat has no valid (non-silent) frames.
     """
     num_frames = min(len(melody_tokens), len(chord_tokens))
     num_beats = num_frames // frame_rate
 
-    beat_nic: dict[int, float] = {}
+    beat_nic: dict[int, float | None] = {}
 
     for beat in range(num_beats):
         start_frame = beat * frame_rate
@@ -310,7 +329,8 @@ def note_in_chord_at_beat(
                 matches += 1
             total += 1
 
-        beat_nic[beat] = matches / total if total > 0 else 0.0
+        # Return None for silent beats (paper Section K excludes these)
+        beat_nic[beat] = matches / total if total > 0 else None
 
     return beat_nic
 
