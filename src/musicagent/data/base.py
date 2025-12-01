@@ -23,13 +23,77 @@ class BaseDataset(Dataset, ABC):
         self.config = config
         self.split = split
 
-        # Load vocabularies
-        with open(config.vocab_melody) as f:
-            self.vocab_melody: dict[str, int] = json.load(f)['token_to_id']
-        with open(config.vocab_chord) as f:
-            self.vocab_chord: dict[str, int] = json.load(f)['token_to_id']
+        # Whether sequences on disk are already stored in the unified ID space
+        # produced by preprocessing (True) or in the legacy per-track spaces
+        # (False, used mainly in tests / older data).
+        self.uses_unified_ids_on_disk: bool = config.vocab_unified.exists()
 
-        # Build reverse mappings for on-the-fly transposition.
+        # Load unified vocabulary created at preprocessing time when available.
+        # For backward compatibility with older tests or preprocessed data that
+        # only saved separate melody/chord vocabularies, we fall back to those
+        # files and reconstruct a unified view on the fly.
+        if self.uses_unified_ids_on_disk:
+            with open(config.vocab_unified) as f:
+                unified = json.load(f)
+            token_to_id: dict[str, int] = unified.get("token_to_id", {})
+        else:
+            # Backward-compatible path: compose a unified mapping from the
+            # original per-track vocabularies. We assume IDs are already
+            # consistent with the on-disk arrays and simply merge the dicts.
+            token_to_id = {}
+            with open(config.vocab_melody) as f:
+                melody_tok = json.load(f)["token_to_id"]
+            with open(config.vocab_chord) as f:
+                chord_tok = json.load(f)["token_to_id"]
+            token_to_id.update(melody_tok)
+            for tok, idx in chord_tok.items():
+                if tok in token_to_id and token_to_id[tok] != idx:
+                    logger.warning(
+                        "Unified vocab conflict when composing from per-track "
+                        "vocabs for token %s: melody=%d, chord=%d",
+                        tok,
+                        token_to_id[tok],
+                        idx,
+                    )
+                token_to_id.setdefault(tok, idx)
+
+        self.unified_token_to_id: dict[str, int] = token_to_id
+        self.unified_id_to_token: dict[int, str] = {
+            idx: tok for tok, idx in token_to_id.items()
+        }
+
+        # Expose unified vocab size for models that operate directly in this
+        # space. We use 1 + max(ID) rather than len(token_to_id) to remain
+        # robust to any sparse ID layouts created at preprocessing time.
+        if token_to_id:
+            self.unified_vocab_size: int = max(token_to_id.values()) + 1
+        else:
+            self.unified_vocab_size = 0
+
+        # Derive melody / chord views from the unified vocabulary based on
+        # token naming conventions used in preprocessing.
+        #
+        # - Melody tokens: "pitch_{midi}_on" / "pitch_{midi}_hold"
+        # - Chord tokens: "{Root}:{quality}/{inv}_on" / "_hold"
+        #
+        # Special tokens (pad/sos/eos/rest) are left out of these views and
+        # handled separately via their numeric IDs in DataConfig.
+        self.vocab_melody: dict[str, int] = {}
+        self.vocab_chord: dict[str, int] = {}
+
+        for tok, idx in token_to_id.items():
+            if tok.startswith("pitch_"):
+                self.vocab_melody[tok] = idx
+            elif tok.endswith("_on") or tok.endswith("_hold"):
+                self.vocab_chord[tok] = idx
+
+        # Expose per-track vocab sizes for convenience (used in training,
+        # evaluation utilities and tests). These counts intentionally exclude
+        # special tokens such as <pad>/<sos>/<eos>/rest.
+        self.melody_vocab_size: int = len(self.vocab_melody)
+        self.chord_vocab_size: int = len(self.vocab_chord)
+
+        # Reverse mappings for on-the-fly transposition.
         self.id_to_melody = {v: k for k, v in self.vocab_melody.items()}
         self.id_to_chord = {v: k for k, v in self.vocab_chord.items()}
 

@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from musicagent.config import DataConfig, OfflineConfig
 from musicagent.data import OfflineDataset, make_offline_collate_fn
 from musicagent.models import OfflineTransformer
-from musicagent.utils import setup_logging
+from musicagent.utils import safe_load_state_dict, setup_logging
 
 from .metrics import (
     chord_length_entropy,
@@ -68,9 +68,9 @@ def evaluate_offline(
     model: OfflineTransformer,
     test_loader: DataLoader,
     d_cfg: DataConfig,
-    id_to_melody: dict[int, str],
-    id_to_chord: dict[int, str],
     device: torch.device,
+    id_to_melody: dict[int, str] | None = None,
+    id_to_chord: dict[int, str] | None = None,
     temperature: float = 1.0,
     sample: bool = False,
     log_progress: bool = True,
@@ -94,6 +94,35 @@ def evaluate_offline(
     import numpy as np
 
     result = OfflineEvalResult()
+
+    dataset = getattr(test_loader, "dataset", None)
+
+    # Determine whether sequences on disk are already in unified ID space.
+    uses_unified_ids_on_disk = bool(
+        getattr(dataset, "uses_unified_ids_on_disk", False)
+    )
+
+    # If explicit mappings are not provided, fall back to dataset-provided ones.
+    # For unified-ID pipelines we use the unified mapping; for legacy pipelines
+    # we decode via the original per-track vocabularies.
+    if id_to_melody is None or id_to_chord is None:
+        if dataset is None:
+            raise ValueError(
+                "id_to_melody/id_to_chord not provided and test_loader has no dataset."
+            )
+
+        if uses_unified_ids_on_disk and hasattr(dataset, "unified_id_to_token"):
+            unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
+            id_to_melody = unified_map
+            id_to_chord = unified_map
+        elif hasattr(dataset, "id_to_melody") and hasattr(dataset, "id_to_chord"):
+            id_to_melody = dataset.id_to_melody  # type: ignore[assignment]
+            id_to_chord = dataset.id_to_chord  # type: ignore[assignment]
+        else:
+            raise ValueError(
+                "Dataset does not expose unified_id_to_token or id_to_melody/id_to_chord "
+                "for decoding."
+            )
 
     # --- 1. Test loss / perplexity (teacher-forced) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
@@ -235,17 +264,17 @@ def main():
         collate_fn=collate,
     )
 
-    # Build reverse vocab mappings
-    id_to_melody = {v: k for k, v in test_ds.vocab_melody.items()}
-    id_to_chord = {v: k for k, v in test_ds.vocab_chord.items()}
-
-    # Load model
-    vocab_src = len(test_ds.vocab_melody)
-    vocab_tgt = len(test_ds.vocab_chord)
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src, vocab_tgt).to(device)
-    model.load_state_dict(
-        torch.load(args.checkpoint, map_location=device, weights_only=True)
-    )
+    # Load model (unified ID space)
+    vocab_size = test_ds.unified_vocab_size
+    chord_token_ids = sorted(test_ds.vocab_chord.values())
+    model = OfflineTransformer(
+        m_cfg,
+        d_cfg,
+        vocab_size=vocab_size,
+        chord_token_ids=chord_token_ids,
+    ).to(device)
+    state_dict = safe_load_state_dict(args.checkpoint, map_location=device)
+    model.load_state_dict(state_dict)
     model.eval()
     logger.info(f"Loaded checkpoint from {args.checkpoint}")
 
@@ -254,8 +283,6 @@ def main():
         model=model,
         test_loader=test_loader,
         d_cfg=d_cfg,
-        id_to_melody=id_to_melody,
-        id_to_chord=id_to_chord,
         device=device,
         temperature=args.temperature,
         sample=args.sample,

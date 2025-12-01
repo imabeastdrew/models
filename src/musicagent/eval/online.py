@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from musicagent.config import DataConfig, OnlineConfig
 from musicagent.data import OnlineDataset, make_online_collate_fn
 from musicagent.models import OnlineTransformer
-from musicagent.utils import setup_logging
+from musicagent.utils import safe_load_state_dict, setup_logging
 
 from .metrics import (
     chord_length_entropy,
@@ -68,22 +68,25 @@ def extract_melody_and_chords(
     interleaved: torch.Tensor,
     melody_vocab_size: int,
     pad_id: int,
+    uses_unified_ids_on_disk: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract melody frames and reference chord frames from interleaved sequence.
 
     OnlineDataset format: [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
     - Position 0: SOS (chord token in unified space)
     - Odd positions (1, 3, 5, ...): chord tokens (unified space)
-    - Even positions (2, 4, 6, ...): melody tokens (melody space)
+    - Even positions (2, 4, 6, ...): melody tokens (unified space)
 
     Args:
-        interleaved: Interleaved sequence tensor
-        melody_vocab_size: Size of melody vocabulary (chord offset)
-        pad_id: Padding token ID
+        interleaved: Interleaved sequence tensor.
+        melody_vocab_size: Size of melody vocabulary (for legacy unified->chord conversion).
+        pad_id: Padding token ID.
+        uses_unified_ids_on_disk: Whether the on-disk sequences already use unified IDs.
 
     Returns:
-        melody_frames: Tensor of melody token IDs (melody vocab space)
-        ref_chord_frames: Tensor of chord token IDs (chord vocab space, offset removed)
+        melody_frames: Tensor of melody token IDs.
+        ref_chord_frames: Tensor of chord token IDs in *chord vocab* space for
+            legacy datasets, or unified space for fully unified datasets.
     """
     # Skip SOS at position 0
     seq = interleaved[1:]  # Now: [y₁, x₁, y₂, x₂, ...]
@@ -100,13 +103,20 @@ def extract_melody_and_chords(
     melody_frames = melody[:valid_len]
     chord_unified_frames = chord_unified[:valid_len]
 
-    # Convert chord tokens from unified space to chord vocab space
-    # Unified chord ID = chord_id + melody_vocab_size (except PAD stays 0)
-    ref_chord_frames = torch.where(
-        chord_unified_frames == pad_id,
-        chord_unified_frames,
-        chord_unified_frames - melody_vocab_size,
-    )
+    if uses_unified_ids_on_disk:
+        # New pipeline: sequences on disk already use unified IDs, so no
+        # further conversion is required.
+        ref_chord_frames = chord_unified_frames
+    else:
+        # Legacy pipeline: chords were offset into unified space during
+        # OnlineDataset interleaving; convert back to chord-vocab IDs so that
+        # id_to_chord mappings built from the original chord vocabularies
+        # remain valid.
+        ref_chord_frames = torch.where(
+            chord_unified_frames == pad_id,
+            chord_unified_frames,
+            chord_unified_frames - melody_vocab_size,
+        )
 
     return melody_frames, ref_chord_frames
 
@@ -115,10 +125,10 @@ def evaluate_online(
     model: OnlineTransformer,
     test_loader: DataLoader,
     d_cfg: DataConfig,
-    id_to_melody: dict[int, str],
-    id_to_chord: dict[int, str],
-    melody_vocab_size: int,
     device: torch.device,
+    melody_vocab_size: int,
+    id_to_melody: dict[int, str] | None = None,
+    id_to_chord: dict[int, str] | None = None,
     temperature: float = 1.0,
     sample: bool = False,
     log_progress: bool = True,
@@ -131,7 +141,7 @@ def evaluate_online(
         d_cfg: Data configuration
         id_to_melody: Mapping from melody token IDs to strings
         id_to_chord: Mapping from chord token IDs to strings
-        melody_vocab_size: Size of melody vocabulary (for unified->chord conversion)
+        melody_vocab_size: Size of melody vocabulary (kept for API compatibility)
         device: Device to run evaluation on
         temperature: Sampling temperature (only used with sample=True)
         sample: If True, sample from distribution; otherwise greedy decode
@@ -143,6 +153,41 @@ def evaluate_online(
     import numpy as np
 
     result = OnlineEvalResult()
+
+    dataset = getattr(test_loader, "dataset", None)
+
+    # Determine whether sequences on disk are already in unified ID space.
+    # For safety and backward compatibility, we default to *legacy* behavior
+    # (False) when the dataset is missing or does not expose the flag, rather
+    # than silently assuming unified IDs and risking incorrect decoding.
+    if dataset is not None and hasattr(dataset, "uses_unified_ids_on_disk"):
+        uses_unified_ids_on_disk = bool(dataset.uses_unified_ids_on_disk)  # type: ignore[attr-defined]
+    else:
+        uses_unified_ids_on_disk = False
+
+    # If explicit mappings are not provided, fall back to dataset-provided ones.
+    # For unified-ID pipelines we use the unified mapping; for legacy pipelines
+    # we decode via the original per-track vocabularies.
+    if id_to_melody is None or id_to_chord is None:
+        if dataset is None:
+            raise ValueError(
+                "id_to_melody/id_to_chord not provided and test_loader has no dataset."
+            )
+
+        if uses_unified_ids_on_disk and hasattr(dataset, "unified_id_to_token"):
+            # New pipeline: unified IDs on disk, decode via unified vocab.
+            unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
+            id_to_melody = unified_map
+            id_to_chord = unified_map
+        elif hasattr(dataset, "id_to_melody") and hasattr(dataset, "id_to_chord"):
+            # Legacy pipeline: decode via separate melody / chord vocabularies.
+            id_to_melody = dataset.id_to_melody  # type: ignore[assignment]
+            id_to_chord = dataset.id_to_chord  # type: ignore[assignment]
+        else:
+            raise ValueError(
+                "Dataset does not expose unified_id_to_token or id_to_melody/id_to_chord "
+                "for decoding."
+            )
 
     # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, reduction="sum")
@@ -203,7 +248,10 @@ def evaluate_online(
                 interleaved = interleaved_batch[i]
 
                 melody_frames, ref_chord_frames = extract_melody_and_chords(
-                    interleaved, melody_vocab_size, d_cfg.pad_id
+                    interleaved,
+                    melody_vocab_size,
+                    d_cfg.pad_id,
+                    uses_unified_ids_on_disk,
                 )
 
                 if len(melody_frames) == 0:
@@ -307,17 +355,20 @@ def main():
         collate_fn=collate,
     )
 
-    # Build reverse vocab mappings
-    id_to_melody = {v: k for k, v in test_ds.vocab_melody.items()}
-    id_to_chord = {v: k for k, v in test_ds.vocab_chord.items()}
     melody_vocab_size = test_ds.melody_vocab_size
     chord_vocab_size = test_ds.chord_vocab_size
 
-    # Load model
-    model = OnlineTransformer(m_cfg, d_cfg, melody_vocab_size, chord_vocab_size).to(device)
-    model.load_state_dict(
-        torch.load(args.checkpoint, map_location=device, weights_only=True)
-    )
+    # Load model in unified ID space
+    vocab_size = test_ds.unified_vocab_size
+    chord_token_ids = sorted(test_ds.vocab_chord.values())
+    model = OnlineTransformer(
+        m_cfg,
+        d_cfg,
+        vocab_size=vocab_size,
+        chord_token_ids=chord_token_ids,
+    ).to(device)
+    state_dict = safe_load_state_dict(args.checkpoint, map_location=device)
+    model.load_state_dict(state_dict)
     model.eval()
     logger.info(f"Loaded checkpoint from {args.checkpoint}")
 
@@ -326,8 +377,6 @@ def main():
         model=model,
         test_loader=test_loader,
         d_cfg=d_cfg,
-        id_to_melody=id_to_melody,
-        id_to_chord=id_to_chord,
         melody_vocab_size=melody_vocab_size,
         device=device,
         temperature=args.temperature,

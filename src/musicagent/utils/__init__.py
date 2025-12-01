@@ -3,7 +3,7 @@
 from .analysis import AdaptationDynamicsResult, compute_adaptation_dynamics
 from .artifacts import ArtifactPaths, download_wandb_artifact
 from .config import load_configs_from_dir
-from .core import seed_everything, setup_logging
+from .core import safe_load_state_dict, seed_everything, setup_logging
 from .loaders import (
     LoadedModel,
     TestLoaderResult,
@@ -22,6 +22,7 @@ __all__ = [
     # Core
     "setup_logging",
     "seed_everything",
+    "safe_load_state_dict",
     # Registry
     "ModelRegistry",
     "ModelType",

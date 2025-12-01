@@ -99,9 +99,13 @@ def test_offline_main_smoke(tmp_path) -> None:
     melody_vocab, chord_vocab = _create_offline_test_data(data_dir, d_cfg, n_samples=3)
 
     # Build and save a tiny model checkpoint matching the configs above.
-    vocab_src = len(melody_vocab)
-    vocab_tgt = len(chord_vocab)
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src, vocab_tgt)
+    # The evaluation code now operates in unified ID space, so we instantiate
+    # the model with the unified vocab size derived from the composed vocab.
+    vocab_size = max(
+        max(melody_vocab.values(), default=0),
+        max(chord_vocab.values(), default=0),
+    ) + 1
+    model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
     checkpoint_path = tmp_path / "offline_test_model.pt"
     torch.save(model.state_dict(), checkpoint_path)
 

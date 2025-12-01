@@ -86,27 +86,55 @@ class OnlineDataset(BaseDataset):
                 "check preprocessing and DataConfig settings."
             )
 
-        # Build unified vocabulary (melody tokens + chord tokens)
-        # Offset chord tokens to avoid collision with melody tokens
+        # Build unified vocabulary (melody tokens + chord tokens). If a unified
+        # vocabulary was saved at preprocessing time, its size should match the
+        # derived layout here.
         self.melody_vocab_size = len(self.vocab_melody)
         self.chord_vocab_size = len(self.vocab_chord)
+        derived_unified_size = self.melody_vocab_size + self.chord_vocab_size
 
-        # The unified vocab is: [melody tokens] + [chord tokens]
-        # Chord token IDs are offset by melody_vocab_size
-        self.unified_vocab_size = self.melody_vocab_size + self.chord_vocab_size
+        if getattr(self, "unified_vocab_size", None) is None:
+            self.unified_vocab_size = derived_unified_size
+        else:
+            # Sanity check: log if there is a mismatch between on-disk unified
+            # vocab and the composed melody/chord vocabs.
+            if self.unified_vocab_size != derived_unified_size:
+                from musicagent.data.base import logger
+
+                logger.warning(
+                    "Unified vocab size mismatch: derived=%d, loaded=%d",
+                    derived_unified_size,
+                    self.unified_vocab_size,
+                )
 
     def _melody_to_unified(self, token_id: int) -> int:
-        """Convert melody token ID to unified vocab ID (no change)."""
-        return token_id
+        """Convert melody token ID to unified vocab ID.
+
+        For datasets preprocessed with a unified vocabulary, tokens on disk are
+        already in unified ID space so this is an identity mapping. For older
+        datasets (tests), melody tokens also live in their own contiguous range
+        starting at 0, so this remains an identity mapping.
+        """
+        return int(token_id)
 
     def _chord_to_unified(self, token_id: int) -> int:
         """Convert chord token ID to unified vocab ID.
 
         Special handling for PAD: map chord pad (0) to unified pad (0).
-        Other tokens are offset by melody_vocab_size.
+
+        - When sequences on disk are already stored in the unified ID space
+          (the default after reprocessing), this is an identity mapping.
+        - For legacy datasets without a unified vocab on disk, chord IDs are
+          offset above the melody range to create a contiguous unified space.
         """
         if token_id == self.config.pad_id:
             return int(self.config.pad_id)
+
+        # New pipeline: IDs are already unified, do not offset again.
+        if getattr(self, "uses_unified_ids_on_disk", False):
+            return int(token_id)
+
+        # Legacy path: offset chord IDs above the melody range.
         return int(token_id + self.melody_vocab_size)
 
     def _interleave(

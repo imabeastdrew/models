@@ -108,17 +108,16 @@ def test_checkpoint_save_load(tmp_path):
 
     d_cfg = DataConfig(max_len=16)
     m_cfg = OfflineConfig(d_model=32, n_heads=4, n_layers=2)
-    vocab_src = 10
-    vocab_tgt = 10
+    vocab_size = 32
 
     # Create original model
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src, vocab_tgt)
+    model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
 
     # Save state dict
     torch.save(model.state_dict(), checkpoint_path)
 
     # Load new model
-    loaded_model = OfflineTransformer(m_cfg, d_cfg, vocab_src, vocab_tgt)
+    loaded_model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
     loaded_model.load_state_dict(torch.load(checkpoint_path))
 
     # Compare parameters
