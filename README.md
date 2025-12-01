@@ -31,7 +31,3 @@ python -m musicagent.training.offline --help
 python -m musicagent.training.online --help
 ```
 
-# TODO
-
-- Refactor to a unified vocab across preprocessing, training, evaluation, and testing.
-
