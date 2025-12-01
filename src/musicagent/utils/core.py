@@ -82,4 +82,3 @@ def safe_load_state_dict(
     # `torch.load` is typed as returning `Any`; at call sites we only ever use
     # it for model state dicts, so we narrow the type here for static checking.
     return cast(dict[str, Any], state)
-

@@ -68,7 +68,6 @@ def extract_melody_and_chords(
     interleaved: torch.Tensor,
     melody_vocab_size: int,
     pad_id: int,
-    uses_unified_ids_on_disk: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract melody frames and reference chord frames from interleaved sequence.
 
@@ -79,21 +78,20 @@ def extract_melody_and_chords(
 
     Args:
         interleaved: Interleaved sequence tensor.
-        melody_vocab_size: Size of melody vocabulary (for legacy unified->chord conversion).
+        melody_vocab_size: Size of melody vocabulary (unused in unified pipeline,
+            retained for API compatibility).
         pad_id: Padding token ID.
-        uses_unified_ids_on_disk: Whether the on-disk sequences already use unified IDs.
 
     Returns:
         melody_frames: Tensor of melody token IDs.
-        ref_chord_frames: Tensor of chord token IDs in *chord vocab* space for
-            legacy datasets, or unified space for fully unified datasets.
+        ref_chord_frames: Tensor of chord token IDs in unified ID space.
     """
     # Skip SOS at position 0
     seq = interleaved[1:]  # Now: [y₁, x₁, y₂, x₂, ...]
 
     # Extract chord and melody by alternating positions
     chord_unified = seq[0::2]  # positions 0, 2, 4, ... -> y₁, y₂, y₃, ...
-    melody = seq[1::2]         # positions 1, 3, 5, ... -> x₁, x₂, x₃, ...
+    melody = seq[1::2]  # positions 1, 3, 5, ... -> x₁, x₂, x₃, ...
 
     # Find valid length (non-PAD in melody)
     pad_mask = melody == pad_id
@@ -103,22 +101,10 @@ def extract_melody_and_chords(
     melody_frames = melody[:valid_len]
     chord_unified_frames = chord_unified[:valid_len]
 
-    if uses_unified_ids_on_disk:
-        # New pipeline: sequences on disk already use unified IDs, so no
-        # further conversion is required.
-        ref_chord_frames = chord_unified_frames
-    else:
-        # Legacy pipeline: chords were offset into unified space during
-        # OnlineDataset interleaving; convert back to chord-vocab IDs so that
-        # id_to_chord mappings built from the original chord vocabularies
-        # remain valid.
-        ref_chord_frames = torch.where(
-            chord_unified_frames == pad_id,
-            chord_unified_frames,
-            chord_unified_frames - melody_vocab_size,
-        )
-
-    return melody_frames, ref_chord_frames
+    # In the unified pipeline, sequences on disk already use the unified ID
+    # space produced by preprocessing, so we can treat chord frames directly as
+    # chord token IDs in that space.
+    return melody_frames, chord_unified_frames
 
 
 def evaluate_online(
@@ -156,38 +142,21 @@ def evaluate_online(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # Determine whether sequences on disk are already in unified ID space.
-    # For safety and backward compatibility, we default to *legacy* behavior
-    # (False) when the dataset is missing or does not expose the flag, rather
-    # than silently assuming unified IDs and risking incorrect decoding.
-    if dataset is not None and hasattr(dataset, "uses_unified_ids_on_disk"):
-        uses_unified_ids_on_disk = bool(dataset.uses_unified_ids_on_disk)  # type: ignore[attr-defined]
-    else:
-        uses_unified_ids_on_disk = False
-
-    # If explicit mappings are not provided, fall back to dataset-provided ones.
-    # For unified-ID pipelines we use the unified mapping; for legacy pipelines
-    # we decode via the original per-track vocabularies.
+    # In the unified pipeline, sequences on disk already use the unified ID
+    # space produced by preprocessing. If explicit mappings are not provided, we
+    # always decode via this unified vocabulary.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
                 "id_to_melody/id_to_chord not provided and test_loader has no dataset."
             )
 
-        if uses_unified_ids_on_disk and hasattr(dataset, "unified_id_to_token"):
-            # New pipeline: unified IDs on disk, decode via unified vocab.
+        if hasattr(dataset, "unified_id_to_token"):
             unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
             id_to_melody = unified_map
             id_to_chord = unified_map
-        elif hasattr(dataset, "id_to_melody") and hasattr(dataset, "id_to_chord"):
-            # Legacy pipeline: decode via separate melody / chord vocabularies.
-            id_to_melody = dataset.id_to_melody  # type: ignore[assignment]
-            id_to_chord = dataset.id_to_chord  # type: ignore[assignment]
         else:
-            raise ValueError(
-                "Dataset does not expose unified_id_to_token or id_to_melody/id_to_chord "
-                "for decoding."
-            )
+            raise ValueError("Dataset does not expose unified_id_to_token for decoding.")
 
     # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, reduction="sum")
@@ -251,7 +220,6 @@ def evaluate_online(
                     interleaved,
                     melody_vocab_size,
                     d_cfg.pad_id,
-                    uses_unified_ids_on_disk,
                 )
 
                 if len(melody_frames) == 0:

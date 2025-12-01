@@ -13,7 +13,7 @@ def format_tokens_for_display(tokens: list[str], max_n: int = 24) -> str:
     Returns:
         Formatted string for display
     """
-    filtered = [t for t in tokens[:max_n * 2] if not t.startswith("<")]
+    filtered = [t for t in tokens[: max_n * 2] if not t.startswith("<")]
     if not filtered:
         return "(all rest/special tokens)"
 
@@ -49,9 +49,9 @@ def show_example(
     mel_tokens, pred_tokens, ref_tokens = cached_predictions[idx]
     nic = note_in_chord_ratio(mel_tokens, pred_tokens)
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"Example {idx} | NiC: {nic:.1%} | Frames: {len(mel_tokens)}")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
     print("\nMelody:")
     print(format_tokens_for_display(mel_tokens, max_frames))
     print("\nPredicted Chords:")
@@ -76,9 +76,7 @@ def get_examples_by_nic_quality(
 
     sorted_indices = sorted(
         cached_predictions.keys(),
-        key=lambda idx: note_in_chord_ratio(
-            cached_predictions[idx][0], cached_predictions[idx][1]
-        ),
+        key=lambda idx: note_in_chord_ratio(cached_predictions[idx][0], cached_predictions[idx][1]),
         reverse=True,
     )
 
@@ -109,4 +107,3 @@ def show_examples_by_quality(
     show_example(cached_predictions, best_idx, max_frames)
     show_example(cached_predictions, median_idx, max_frames)
     show_example(cached_predictions, worst_idx, max_frames)
-

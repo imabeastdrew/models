@@ -38,4 +38,3 @@ def download_wandb_artifact(
     checkpoint_path = artifact_dir / "best_model.pt"
 
     return ArtifactPaths(artifact_dir=artifact_dir, checkpoint_path=checkpoint_path)
-

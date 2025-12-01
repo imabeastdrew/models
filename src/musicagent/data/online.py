@@ -42,7 +42,7 @@ class OnlineDataset(BaseDataset):
     At inference, we only use chord predictions (odd positions).
     """
 
-    def __init__(self, config: DataConfig, split: str = 'train'):
+    def __init__(self, config: DataConfig, split: str = "train"):
         super().__init__(config, split)
 
         src_path = config.data_processed / f"{split}_src.npy"
@@ -51,8 +51,8 @@ class OnlineDataset(BaseDataset):
         if not src_path.exists():
             raise FileNotFoundError(f"Data not found at {src_path}")
 
-        self.src_data = np.load(src_path, mmap_mode='r')
-        self.tgt_data = np.load(tgt_path, mmap_mode='r')
+        self.src_data = np.load(src_path, mmap_mode="r")
+        self.tgt_data = np.load(tgt_path, mmap_mode="r")
 
         if len(self.src_data) != len(self.tgt_data):
             raise ValueError(f"Mismatch: src={len(self.src_data)}, tgt={len(self.tgt_data)}")
@@ -89,46 +89,25 @@ class OnlineDataset(BaseDataset):
                 "check preprocessing and DataConfig settings."
             )
 
-        # Build unified vocabulary (melody tokens + chord tokens).
+        # Build unified vocabulary views (melody tokens + chord tokens).
         #
-        # Tests (and legacy code paths) expect `melody_vocab_size` and
-        # `chord_vocab_size` to count **both** special tokens
-        # (<pad>/<sos>/<eos>/rest) and musical tokens, i.e. to match the sizes
-        # of the original per-track vocabularies created during preprocessing.
+        # `BaseDataset` has already loaded the unified vocabulary created at
+        # preprocessing time, exposing:
+        #   - `unified_vocab_size`
+        #   - `vocab_melody` / `vocab_chord` (excluding specials)
         #
-        # `BaseDataset.vocab_melody` / `vocab_chord` intentionally exclude
-        # specials so that transposition only touches musical symbols. We add
-        # the shared special set back in when reporting the per-track sizes.
+        # For convenience (training logs, tests) we expose logical per-track
+        # vocab sizes that *include* the shared special tokens.
         special_ids = {
             self.config.pad_id,
             self.config.sos_id,
             self.config.eos_id,
             self.config.rest_id,
         }
-        # Treat all specials as present in both melody and chord vocabularies.
         num_specials = len(special_ids)
 
         self.melody_vocab_size = len(self.vocab_melody) + num_specials
         self.chord_vocab_size = len(self.vocab_chord) + num_specials
-        derived_unified_size = self.melody_vocab_size + self.chord_vocab_size
-
-        # For datasets preprocessed with a unified vocabulary on disk, the
-        # `BaseDataset` has already set `unified_vocab_size` from that file.
-        # We log if there is any unexpected mismatch. For older tests or data
-        # without a unified vocab, we define the unified size from the derived
-        # melody/chord layout.
-        if getattr(self, "uses_unified_ids_on_disk", False):
-            if hasattr(self, "unified_vocab_size"):
-                if self.unified_vocab_size != derived_unified_size:
-                    logger.warning(
-                        "Unified vocab size mismatch: derived=%d, loaded=%d",
-                        derived_unified_size,
-                        self.unified_vocab_size,
-                    )
-            else:
-                self.unified_vocab_size = derived_unified_size
-        else:
-            self.unified_vocab_size = derived_unified_size
 
     def _melody_to_unified(self, token_id: int) -> int:
         """Convert melody token ID to unified vocab ID.
@@ -143,22 +122,12 @@ class OnlineDataset(BaseDataset):
     def _chord_to_unified(self, token_id: int) -> int:
         """Convert chord token ID to unified vocab ID.
 
-        Special handling for PAD: map chord pad (0) to unified pad (0).
-
-        - When sequences on disk are already stored in the unified ID space
-          (the default after reprocessing), this is an identity mapping.
-        - For legacy datasets without a unified vocab on disk, chord IDs are
-          offset above the melody range to create a contiguous unified space.
+        In the current pipeline all sequences on disk already use the unified
+        ID space produced by preprocessing, so this is effectively an identity
+        mapping. We keep the helper for clarity and symmetry with
+        ``_melody_to_unified``.
         """
-        if token_id == self.config.pad_id:
-            return int(self.config.pad_id)
-
-        # New pipeline: IDs are already unified, do not offset again.
-        if getattr(self, "uses_unified_ids_on_disk", False):
-            return int(token_id)
-
-        # Legacy path: offset chord IDs above the melody range.
-        return int(token_id + self.melody_vocab_size)
+        return int(token_id)
 
     def _interleave(
         self,
@@ -243,7 +212,7 @@ class OnlineDataset(BaseDataset):
         melody_frames = src_arr[start_frame:end_frame]
         chord_frames = tgt_arr[start_frame:end_frame]
 
-        if self.split == 'train':
+        if self.split == "train":
             # Cap the usable number of frames to effective_max_len and apply
             # random cropping when sequences are longer.
             frames_len = len(melody_frames)
@@ -288,7 +257,7 @@ class OnlineDataset(BaseDataset):
         # For language modeling, input is [:-1] and target is [1:]
         # But we return the full sequence; the training loop handles the shift
         return {
-            'input_ids': torch.tensor(interleaved, dtype=torch.long),
+            "input_ids": torch.tensor(interleaved, dtype=torch.long),
         }
 
 
@@ -301,6 +270,7 @@ def make_online_collate_fn(pad_id: int = 0):
     Returns:
         A collate function that pads sequences to uniform length.
     """
+
     def collate_fn(batch: list) -> torch.Tensor:
         """Collate function for online dataset (single interleaved sequence).
 
@@ -329,4 +299,3 @@ def make_online_collate_fn(pad_id: int = 0):
         return padded
 
     return collate_fn
-

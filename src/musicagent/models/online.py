@@ -148,7 +148,7 @@ class OnlineTransformer(nn.Module):
         causal_mask = self._create_causal_mask(seq_len, device)
 
         # Create padding mask
-        padding_mask = (input_ids == self.pad_id)
+        padding_mask = input_ids == self.pad_id
 
         # Embed and add positional encoding
         x = self.pos_enc(self.embed(input_ids))
@@ -264,12 +264,14 @@ class OnlineTransformer(nn.Module):
 
             # Append in CORRECT order matching training: chord (y_t) THEN melody (x_t)
             # This builds: [SOS, y₁, x₁, y₂, x₂, ...]
-            sequence = torch.cat([
-                sequence,
-                next_unified.unsqueeze(1),
-                mel_unified.unsqueeze(1),
-            ], dim=1)
+            sequence = torch.cat(
+                [
+                    sequence,
+                    next_unified.unsqueeze(1),
+                    mel_unified.unsqueeze(1),
+                ],
+                dim=1,
+            )
 
         # Stack generated chords: (batch, num_chords) in unified ID space.
         return torch.stack(generated_chords, dim=1)
-

@@ -32,4 +32,3 @@ def main() -> None:
         online_main()
     else:
         offline_main()
-

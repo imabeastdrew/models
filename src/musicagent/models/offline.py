@@ -228,4 +228,3 @@ class OfflineTransformer(nn.Module):
 
         # Ensure we never exceed ``max_len`` in the returned sequence.
         return tensor_generated[:, :max_len]
-

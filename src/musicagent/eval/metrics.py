@@ -17,8 +17,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # 12 pitch classes
-PITCH_CLASSES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
-
+PITCH_CLASSES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
 
 def parse_chord_token(token: str) -> tuple[str | None, str | None]:
@@ -26,21 +25,21 @@ def parse_chord_token(token: str) -> tuple[str | None, str | None]:
 
     Returns (None, None) for special tokens (pad/sos/eos/rest) or unparseable.
     """
-    if token.startswith('<') or token == 'rest':
+    if token.startswith("<") or token == "rest":
         return None, None
 
     # Strip _on / _hold suffix
-    if token.endswith('_on'):
+    if token.endswith("_on"):
         base = token[:-3]
-    elif token.endswith('_hold'):
+    elif token.endswith("_hold"):
         base = token[:-5]
     else:
         return None, None
 
     # Split root:quality/inversion
     try:
-        root, rest = base.split(':', 1)
-        quality = rest.split('/')[0]  # ignore inversion for pitch-class membership
+        root, rest = base.split(":", 1)
+        quality = rest.split("/")[0]  # ignore inversion for pitch-class membership
         return root, quality
     except ValueError:
         return None, None
@@ -99,10 +98,10 @@ def parse_melody_token(token: str) -> int | None:
 
     Returns None for special tokens.
     """
-    if not token.startswith('pitch_'):
+    if not token.startswith("pitch_"):
         return None
     try:
-        _, pitch_str, _ = token.split('_', 2)
+        _, pitch_str, _ = token.split("_", 2)
         return int(pitch_str)
     except ValueError:
         return None
@@ -111,6 +110,7 @@ def parse_melody_token(token: str) -> int | None:
 # ---------------------------------------------------------------------------
 # Metric 1: Note-in-Chord Ratio
 # ---------------------------------------------------------------------------
+
 
 def note_in_chord_counts(
     melody_tokens: Sequence[str],
@@ -158,6 +158,7 @@ def note_in_chord_ratio(
 # Metric 2: Chord-to-Note Onset Interval (EMD)
 # ---------------------------------------------------------------------------
 
+
 def onset_intervals(
     melody_tokens: Sequence[str],
     chord_tokens: Sequence[str],
@@ -168,11 +169,11 @@ def onset_intervals(
 
     for t, (mel_tok, chd_tok) in enumerate(zip(melody_tokens, chord_tokens)):
         # Track melody onsets
-        if mel_tok.endswith('_on') and parse_melody_token(mel_tok) is not None:
+        if mel_tok.endswith("_on") and parse_melody_token(mel_tok) is not None:
             last_melody_onset = t
 
         # Track chord onsets
-        if chd_tok.endswith('_on'):
+        if chd_tok.endswith("_on"):
             root, _ = parse_chord_token(chd_tok)
             if root is not None and last_melody_onset is not None:
                 intervals.append(t - last_melody_onset)
@@ -215,6 +216,7 @@ def onset_interval_emd(
 # Metric 3: Chord Length Entropy
 # ---------------------------------------------------------------------------
 
+
 def chord_lengths(chord_tokens: Sequence[str]) -> list[int]:
     """Compute list of chord durations (in frames)."""
     lengths: list[int] = []
@@ -231,12 +233,12 @@ def chord_lengths(chord_tokens: Sequence[str]) -> list[int]:
                 current_len = 0
             continue
 
-        if tok.endswith('_on'):
+        if tok.endswith("_on"):
             if in_chord:
                 lengths.append(current_len)
             current_len = 1
             in_chord = True
-        elif tok.endswith('_hold'):
+        elif tok.endswith("_hold"):
             current_len += 1
 
     if in_chord:
@@ -263,6 +265,7 @@ def chord_length_entropy(lengths: Sequence[int], max_bin: int = 32) -> float:
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
+
 
 def decode_tokens(ids: Sequence[int], id_to_token: dict[int, str]) -> list[str]:
     """Convert token IDs back to string tokens.
@@ -333,5 +336,3 @@ def note_in_chord_at_beat(
         beat_nic[beat] = matches / total if total > 0 else None
 
     return beat_nic
-
-

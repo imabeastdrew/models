@@ -47,4 +47,3 @@ __all__ = [
     "get_examples_by_nic_quality",
     "show_examples_by_quality",
 ]
-

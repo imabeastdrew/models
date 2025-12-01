@@ -97,32 +97,21 @@ def evaluate_offline(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # Determine whether sequences on disk are already in unified ID space.
-    uses_unified_ids_on_disk = bool(
-        getattr(dataset, "uses_unified_ids_on_disk", False)
-    )
-
-    # If explicit mappings are not provided, fall back to dataset-provided ones.
-    # For unified-ID pipelines we use the unified mapping; for legacy pipelines
-    # we decode via the original per-track vocabularies.
+    # In the unified pipeline, sequences on disk already use the unified ID
+    # space produced by preprocessing. If explicit mappings are not provided, we
+    # always decode via this unified vocabulary.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
                 "id_to_melody/id_to_chord not provided and test_loader has no dataset."
             )
 
-        if uses_unified_ids_on_disk and hasattr(dataset, "unified_id_to_token"):
+        if hasattr(dataset, "unified_id_to_token"):
             unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
             id_to_melody = unified_map
             id_to_chord = unified_map
-        elif hasattr(dataset, "id_to_melody") and hasattr(dataset, "id_to_chord"):
-            id_to_melody = dataset.id_to_melody  # type: ignore[assignment]
-            id_to_chord = dataset.id_to_chord  # type: ignore[assignment]
         else:
-            raise ValueError(
-                "Dataset does not expose unified_id_to_token or id_to_melody/id_to_chord "
-                "for decoding."
-            )
+            raise ValueError("Dataset does not expose unified_id_to_token for decoding.")
 
     # --- 1. Test loss / perplexity (teacher-forced) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)

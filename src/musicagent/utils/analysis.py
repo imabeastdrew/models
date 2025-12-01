@@ -72,4 +72,3 @@ def compute_adaptation_dynamics(
         beat_stds=beat_stds,
         samples_per_beat=samples_per_beat,
     )
-

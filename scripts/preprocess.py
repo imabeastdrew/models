@@ -20,7 +20,7 @@ from musicagent.config import DataConfig
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stderr)]
+    handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger(__name__)
 
@@ -50,17 +50,18 @@ class Vocabulary:
         return self.token_to_id.get(token, self.config.rest_id)
 
     def save(self, path: Path) -> None:
-        with open(path, 'w') as f:
-            json.dump({
-                'token_to_id': self.token_to_id,
-                'counts': dict(self.counts.most_common())
-            }, f, indent=2)
+        with open(path, "w") as f:
+            json.dump(
+                {"token_to_id": self.token_to_id, "counts": dict(self.counts.most_common())},
+                f,
+                indent=2,
+            )
         logger.info(f"Saved {self.name} vocabulary to {path} (Size: {len(self.token_to_id)})")
 
 
 class ChordMapper:
     def __init__(self):
-        self.root_names = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+        self.root_names = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
     def get_token(self, root_pc: int, intervals: list[int], inversion: int) -> str:
         quality = "-".join(map(str, intervals))
@@ -87,33 +88,31 @@ def process_dataset(config: DataConfig) -> None:
     # Pass 1: Build Vocabulary
 
     logger.info("Pass 1: Building Vocabulary...")
-    with open(config.data_raw, 'rb') as f:
-        for _, data in tqdm(ijson.kvitems(f, ''), desc="Building Vocab"):
-            annot = data.get('annotations', {})
+    with open(config.data_raw, "rb") as f:
+        for _, data in tqdm(ijson.kvitems(f, ""), desc="Building Vocab"):
+            annot = data.get("annotations", {})
 
             # Augment vocab by all transpositions in [-max_transpose, max_transpose].
             for transpose in range(-config.max_transpose, config.max_transpose + 1):
-                if annot.get('melody'):
-                    for n in annot['melody']:
-                        pitch = n['pitch_class'] + (n['octave'] * 12) + config.center_midi
+                if annot.get("melody"):
+                    for n in annot["melody"]:
+                        pitch = n["pitch_class"] + (n["octave"] * 12) + config.center_midi
                         tp_pitch = get_transposed_pitch(pitch, transpose)
                         melody_vocab.add(f"pitch_{tp_pitch}_on")
                         melody_vocab.add(f"pitch_{tp_pitch}_hold")
 
-                if annot.get('harmony'):
-                    for c in annot['harmony']:
+                if annot.get("harmony"):
+                    for c in annot["harmony"]:
                         # Some annotations may have empty or missing interval lists.
                         # These would produce an empty chord "quality" string, which
                         # later cannot be parsed by the evaluation metrics.
-                        intervals = c.get('root_position_intervals') or []
+                        intervals = c.get("root_position_intervals") or []
                         if not intervals:
                             # Treat these as "no chord" and skip them in the vocab.
                             continue
 
-                        tp_root = (c['root_pitch_class'] + transpose) % 12
-                        token = chord_mapper.get_token(
-                            tp_root, intervals, c['inversion']
-                        )
+                        tp_root = (c["root_pitch_class"] + transpose) % 12
+                        token = chord_mapper.get_token(tp_root, intervals, c["inversion"])
                         chord_vocab.add(f"{token}_on")
                         chord_vocab.add(f"{token}_hold")
 
@@ -197,13 +196,13 @@ def process_dataset(config: DataConfig) -> None:
     # uses the same unified mapping.
     logger.info("Pass 2: Tokenizing to Numpy (unified IDs)...")
 
-    buffers = defaultdict(lambda: {'src': [], 'tgt': []})
+    buffers = defaultdict(lambda: {"src": [], "tgt": []})
 
-    with open(config.data_raw, 'rb') as f:
-        for _, data in tqdm(ijson.kvitems(f, ''), desc="Tokenizing"):
-            split = data.get('split', 'TRAIN').lower()
-            annot = data.get('annotations', {})
-            num_beats = annot.get('num_beats', 0)
+    with open(config.data_raw, "rb") as f:
+        for _, data in tqdm(ijson.kvitems(f, ""), desc="Tokenizing"):
+            split = data.get("split", "TRAIN").lower()
+            annot = data.get("annotations", {})
+            num_beats = annot.get("num_beats", 0)
             if num_beats <= 0:
                 continue
 
@@ -222,12 +221,12 @@ def process_dataset(config: DataConfig) -> None:
             c_row[0] = config.sos_id
 
             # Melody
-            if annot.get('melody'):
-                for n in annot['melody']:
-                    start = int(round(n['onset'] * config.frame_rate))
-                    end = int(round(n['offset'] * config.frame_rate))
+            if annot.get("melody"):
+                for n in annot["melody"]:
+                    start = int(round(n["onset"] * config.frame_rate))
+                    end = int(round(n["offset"] * config.frame_rate))
 
-                    pitch = n['pitch_class'] + (n['octave'] * 12) + config.center_midi
+                    pitch = n["pitch_class"] + (n["octave"] * 12) + config.center_midi
                     tp_pitch = get_transposed_pitch(pitch, transpose)
                     token_on = f"pitch_{tp_pitch}_on"
                     token_hold = f"pitch_{tp_pitch}_hold"
@@ -243,21 +242,19 @@ def process_dataset(config: DataConfig) -> None:
                         m_row[arr_idx] = id_on if idx == start else id_hold
 
             # Harmony
-            if annot.get('harmony'):
-                for c in annot['harmony']:
+            if annot.get("harmony"):
+                for c in annot["harmony"]:
                     # As in the vocab pass, skip chords with empty / missing interval
                     # lists so we don't create unparseable chord qualities.
-                    intervals = c.get('root_position_intervals') or []
+                    intervals = c.get("root_position_intervals") or []
                     if not intervals:
                         continue
 
-                    start = int(round(c['onset'] * config.frame_rate))
-                    end = int(round(c['offset'] * config.frame_rate))
+                    start = int(round(c["onset"] * config.frame_rate))
+                    end = int(round(c["offset"] * config.frame_rate))
 
-                    tp_root = (c['root_pitch_class'] + transpose) % 12
-                    base_token = chord_mapper.get_token(
-                        tp_root, intervals, c['inversion']
-                    )
+                    tp_root = (c["root_pitch_class"] + transpose) % 12
+                    base_token = chord_mapper.get_token(tp_root, intervals, c["inversion"])
                     token_on = f"{base_token}_on"
                     token_hold = f"{base_token}_hold"
 
@@ -279,16 +276,16 @@ def process_dataset(config: DataConfig) -> None:
                 m_row[eos_idx + 1 :] = config.pad_id
                 c_row[eos_idx + 1 :] = config.pad_id
 
-            buffers[split]['src'].append(m_row)
-            buffers[split]['tgt'].append(c_row)
+            buffers[split]["src"].append(m_row)
+            buffers[split]["tgt"].append(c_row)
 
     # Save buffers to disk
     for split, data in buffers.items():
-        if not data['src']:
+        if not data["src"]:
             continue
 
-        src_arr = np.stack(data['src'])
-        tgt_arr = np.stack(data['tgt'])
+        src_arr = np.stack(data["src"])
+        tgt_arr = np.stack(data["tgt"])
 
         out_src = config.data_processed / f"{split}_src.npy"
         out_tgt = config.data_processed / f"{split}_tgt.npy"
@@ -314,4 +311,3 @@ if __name__ == "__main__":
         cfg.data_processed = args.output
 
     process_dataset(cfg)
-

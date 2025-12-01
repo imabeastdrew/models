@@ -23,6 +23,43 @@ def _write_vocab(path: Path, token_to_id: dict) -> None:
         json.dump({"token_to_id": token_to_id}, f)
 
 
+def _write_unified_vocab(
+    cfg: DataConfig,
+    melody_token_to_id: dict[str, int],
+    chord_token_to_id: dict[str, int],
+) -> dict[str, int]:
+    """Create and write a unified vocabulary mirroring scripts/preprocess.py.
+
+    The unified mapping:
+    - Shares IDs for special tokens (<pad>/<sos>/<eos>/rest) across tracks.
+    - Keeps melody IDs as-is.
+    - Offsets non-special chord IDs above the melody range so that a single
+      embedding table can cover both tracks.
+    """
+    unified_token_to_id: dict[str, int] = {}
+
+    # 1) Copy melody tokens directly.
+    unified_token_to_id.update(melody_token_to_id)
+    melody_size = len(melody_token_to_id)
+
+    special_ids = {
+        cfg.pad_id,
+        cfg.sos_id,
+        cfg.eos_id,
+        cfg.rest_id,
+    }
+
+    # 2) Add chord tokens, sharing special IDs and offsetting the rest.
+    for token, cid in chord_token_to_id.items():
+        if cid in special_ids:
+            unified_token_to_id[token] = cid
+        else:
+            unified_token_to_id[token] = melody_size + cid
+
+    _write_vocab(cfg.vocab_unified, unified_token_to_id)
+    return unified_token_to_id
+
+
 def _create_test_dataset(
     tmp_path: Path,
     cfg: DataConfig,
@@ -48,8 +85,8 @@ def _create_test_dataset(
         cfg.eos_token: cfg.eos_id,
         cfg.rest_token: cfg.rest_id,
     }
-    roots = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
-    qualities = ['4-3', '3-4', '4-3-3']  # common triad / 7th-style intervals
+    roots = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+    qualities = ["4-3", "3-4", "4-3-3"]  # common triad / 7th-style intervals
     for root in roots:
         for quality in qualities:
             base = f"{root}:{quality}/0"
@@ -58,6 +95,9 @@ def _create_test_dataset(
 
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
+
+    # Unified vocabulary matching the real preprocessing pipeline.
+    unified_token_to_id = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     # Create sample sequences
     src = np.full((n_samples, cfg.storage_len), cfg.rest_id, dtype=np.int32)
@@ -68,8 +108,8 @@ def _create_test_dataset(
         src[i, 0] = cfg.sos_id
         tgt[i, 0] = cfg.sos_id
         for j in range(1, seq_len):
-            src[i, j] = melody_token_to_id["pitch_60_on"]
-            tgt[i, j] = chord_token_to_id["C:4-3/0_on"]
+            src[i, j] = unified_token_to_id["pitch_60_on"]
+            tgt[i, j] = unified_token_to_id["C:4-3/0_on"]
         src[i, seq_len] = cfg.eos_id
         tgt[i, seq_len] = cfg.eos_id
         if seq_len + 1 < cfg.storage_len:
@@ -135,10 +175,10 @@ def test_transpose_melody(tmp_path: Path) -> None:
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     chord_token_to_id = {cfg.pad_token: cfg.pad_id}
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     src = np.array(
-        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]],
-        dtype=np.int32
+        [[cfg.sos_id, unified_ids["pitch_60_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32
     )
     tgt = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
     np.save(cfg.data_processed / "train_src.npy", src)
@@ -158,7 +198,7 @@ def test_transpose_chord(tmp_path: Path) -> None:
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
-        cfg.rest_token: cfg.rest_id
+        cfg.rest_token: cfg.rest_id,
     }
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     chord_token_to_id = {
@@ -173,10 +213,11 @@ def test_transpose_chord(tmp_path: Path) -> None:
     }
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
+    unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
+
     src = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
     tgt = np.array(
-        [[cfg.sos_id, chord_token_to_id["C:4-3/0_on"], cfg.eos_id, cfg.pad_id]],
-        dtype=np.int32
+        [[cfg.sos_id, unified_ids["C:4-3/0_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32
     )
     np.save(cfg.data_processed / "train_src.npy", src)
     np.save(cfg.data_processed / "train_tgt.npy", tgt)
@@ -184,7 +225,7 @@ def test_transpose_chord(tmp_path: Path) -> None:
     ds = OfflineDataset(cfg, split="train")
     original_seq = tgt[0]
     transposed = ds._transpose_chord(original_seq, semitones=2)
-    assert transposed[1] == chord_token_to_id["D:4-3/0_on"]
+    assert transposed[1] == unified_ids["D:4-3/0_on"]
     assert transposed[0] == cfg.sos_id
     assert transposed[2] == cfg.eos_id
 
@@ -193,10 +234,7 @@ def test_transpose_zero_semitones_unchanged(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=16, max_len=16)
     melody_vocab, _ = _create_test_dataset(tmp_path, cfg)
     ds = OfflineDataset(cfg, split="train")
-    original = np.array(
-        [cfg.sos_id, melody_vocab["pitch_60_on"], cfg.eos_id],
-        dtype=np.int32
-    )
+    original = np.array([cfg.sos_id, melody_vocab["pitch_60_on"], cfg.eos_id], dtype=np.int32)
     transposed = ds._transpose_melody(original, semitones=0)
     assert np.array_equal(original, transposed)
 
@@ -219,8 +257,11 @@ def test_dataset_file_not_found(tmp_path: Path) -> None:
 
 def test_dataset_length_mismatch(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=16, max_len=16)
-    _write_vocab(cfg.vocab_melody, {cfg.pad_token: 0})
-    _write_vocab(cfg.vocab_chord, {cfg.pad_token: 0})
+    melody_token_to_id = {cfg.pad_token: cfg.pad_id}
+    chord_token_to_id = {cfg.pad_token: cfg.pad_id}
+    _write_vocab(cfg.vocab_melody, melody_token_to_id)
+    _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
     np.save(cfg.data_processed / "train_src.npy", np.zeros((5, 16), dtype=np.int32))
     np.save(cfg.data_processed / "train_tgt.npy", np.zeros((3, 16), dtype=np.int32))
     with pytest.raises(ValueError, match="Mismatch"):
@@ -240,11 +281,12 @@ def test_transpose_missing_token_logs_warning(tmp_path: Path, caplog) -> None:
         "pitch_60_on": 4,
     }
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    _write_vocab(cfg.vocab_chord, {cfg.pad_token: 0})
+    chord_token_to_id = {cfg.pad_token: cfg.pad_id}
+    _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     src = np.array(
-        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]],
-        dtype=np.int32
+        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32
     )
     tgt = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
     np.save(cfg.data_processed / "train_src.npy", src)
@@ -312,21 +354,24 @@ def test_online_dataset_interleave_format(tmp_path: Path) -> None:
 
     # Check position 0 is a chord token in unified vocab
     sos_token = input_ids[0].item()
-    assert sos_token >= melody_vocab_size or sos_token < 4, \
+    assert sos_token >= melody_vocab_size or sos_token < 4, (
         f"Position 0 should be SOS chord token, got {sos_token}"
+    )
 
     # Odd positions should be chord tokens (offset by melody_vocab_size
     # or special tokens)
     for i in range(1, len(input_ids), 2):
         chord_token = input_ids[i].item()
-        assert chord_token >= melody_vocab_size or chord_token < 4, \
+        assert chord_token >= melody_vocab_size or chord_token < 4, (
             f"Odd position {i} should be chord token, got {chord_token}"
+        )
 
     # Even positions >= 2 should be melody tokens (no offset)
     for i in range(2, len(input_ids), 2):
         melody_token = input_ids[i].item()
-        assert melody_token < melody_vocab_size, \
+        assert melody_token < melody_vocab_size, (
             f"Even position {i} should be melody token, got {melody_token}"
+        )
 
 
 def test_online_collate_fn_stacks_batches(tmp_path: Path) -> None:
@@ -366,6 +411,7 @@ def test_online_dataset_filters_zero_frame_sequences(tmp_path: Path) -> None:
     }
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     # Build two sequences:
     #   - index 0: zero-frame sequence -> [SOS, EOS, PAD...]
@@ -383,11 +429,11 @@ def test_online_dataset_filters_zero_frame_sequences(tmp_path: Path) -> None:
 
     # One-frame sample
     src[1, 0] = cfg.sos_id
-    src[1, 1] = melody_token_to_id["pitch_60_on"]
+    src[1, 1] = unified_ids["pitch_60_on"]
     src[1, 2] = cfg.eos_id
     src[1, 3:] = cfg.pad_id
     tgt[1, 0] = cfg.sos_id
-    tgt[1, 1] = chord_token_to_id["C:4-3/0_on"]
+    tgt[1, 1] = unified_ids["C:4-3/0_on"]
     tgt[1, 2] = cfg.eos_id
     tgt[1, 3:] = cfg.pad_id
 

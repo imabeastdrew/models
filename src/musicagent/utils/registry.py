@@ -65,4 +65,3 @@ def get_model_registry(model_type: ModelType) -> ModelRegistry:
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
-

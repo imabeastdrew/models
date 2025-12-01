@@ -144,12 +144,12 @@ def test_onset_intervals_and_histogram_and_emd() -> None:
 def test_onset_intervals_ignores_chords_before_first_melody_onset() -> None:
     """Chord onsets before any melody onset should produce no intervals."""
     melody_tokens = [
-        "rest",         # no melody onset yet
+        "rest",  # no melody onset yet
         "pitch_60_on",  # first melody onset
     ]
     chord_tokens = [
-        "C:0-4-7/0_on",   # chord onset before any melody onset
-        "C:0-4-7/0_hold", # no new chord onset
+        "C:0-4-7/0_on",  # chord onset before any melody onset
+        "C:0-4-7/0_hold",  # no new chord onset
     ]
 
     intervals = onset_intervals(melody_tokens, chord_tokens)
@@ -159,13 +159,13 @@ def test_onset_intervals_ignores_chords_before_first_melody_onset() -> None:
 def test_chord_lengths_and_entropy() -> None:
     """Chord length utilities should produce sensible lengths and entropy."""
     chord_tokens = [
-        "C:0-4-7/0_on",   # chord 1 starts
-        "C:0-4-7/0_hold", # chord 1 continues
-        "rest",           # chord 1 ends (length 2)
-        "C:0-4-7/0_on",   # chord 2 starts
-        "C:0-4-7/0_hold", # chord 2 continues
-        "C:0-4-7/0_hold", # chord 2 continues
-        "rest",           # chord 2 ends (length 3)
+        "C:0-4-7/0_on",  # chord 1 starts
+        "C:0-4-7/0_hold",  # chord 1 continues
+        "rest",  # chord 1 ends (length 2)
+        "C:0-4-7/0_on",  # chord 2 starts
+        "C:0-4-7/0_hold",  # chord 2 continues
+        "C:0-4-7/0_hold",  # chord 2 continues
+        "rest",  # chord 2 ends (length 3)
     ]
 
     lengths = chord_lengths(chord_tokens)
@@ -174,5 +174,3 @@ def test_chord_lengths_and_entropy() -> None:
     entropy = chord_length_entropy(lengths)
     # Two distinct lengths with equal probability → entropy = ln(2)
     assert np.isclose(entropy, math.log(2.0))
-
-

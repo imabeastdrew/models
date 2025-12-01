@@ -142,4 +142,3 @@ def create_test_loader(
         melody_vocab_size=getattr(test_ds, "melody_vocab_size", len(id_to_melody)),
         chord_vocab_size=getattr(test_ds, "chord_vocab_size", len(id_to_chord)),
     )
-

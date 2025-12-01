@@ -28,5 +28,4 @@ class PositionalEncoding(nn.Module):
         Returns:
             Tensor with positional encoding added, same shape as input
         """
-        return x + self.pe[:, :x.size(1)]
-
+        return x + self.pe[:, : x.size(1)]

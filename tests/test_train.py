@@ -17,7 +17,7 @@ def test_count_parameters_frozen() -> None:
     """Frozen parameters should not be counted."""
     model = nn.Sequential(
         nn.Linear(10, 5),  # 55 params
-        nn.Linear(5, 2),   # 12 params
+        nn.Linear(5, 2),  # 12 params
     )
     # Freeze first layer
     for param in model[0].parameters():

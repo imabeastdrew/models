@@ -176,7 +176,7 @@ def test_online_causal_mask() -> None:
     model = OnlineTransformer(m_cfg, d_cfg, vocab_size=22)
 
     seq_len = 6
-    mask = model._create_causal_mask(seq_len, torch.device('cpu'))
+    mask = model._create_causal_mask(seq_len, torch.device("cpu"))
 
     assert mask.shape == (seq_len, seq_len)
     assert mask.dtype == torch.bool
@@ -188,6 +188,7 @@ def test_online_causal_mask() -> None:
                 assert mask[i, j].item() is True
             else:
                 assert mask[i, j].item() is False
+
 
 def test_online_unified_vocab_size() -> None:
     """Model should expose the configured unified vocab size."""

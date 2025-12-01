@@ -44,4 +44,3 @@ def load_configs_from_dir(
         m_cfg = model_config_class(**json.load(f))
 
     return d_cfg, m_cfg
-

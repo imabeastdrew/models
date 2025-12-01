@@ -46,7 +46,26 @@ def _create_offline_test_data(
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
-    # Create test split only, matching the on-disk layout from preprocessing.
+    # Unified vocabulary mirroring scripts/preprocess.py.
+    unified_token_to_id: dict[str, int] = {}
+    unified_token_to_id.update(melody_token_to_id)
+    melody_size = len(melody_token_to_id)
+
+    special_ids = {
+        cfg.pad_id,
+        cfg.sos_id,
+        cfg.eos_id,
+        cfg.rest_id,
+    }
+    for token, cid in chord_token_to_id.items():
+        if cid in special_ids:
+            unified_token_to_id[token] = cid
+        else:
+            unified_token_to_id[token] = melody_size + cid
+
+    _write_vocab(cfg.vocab_unified, unified_token_to_id)
+
+    # Create test split only, matching the unified on-disk layout from preprocessing.
     src = np.full((n_samples, cfg.storage_len), cfg.rest_id, dtype=np.int32)
     tgt = np.full((n_samples, cfg.storage_len), cfg.rest_id, dtype=np.int32)
 
@@ -54,11 +73,11 @@ def _create_offline_test_data(
         # SOS at position 0
         src[i, 0] = cfg.sos_id
         tgt[i, 0] = cfg.sos_id
-        # A short melody/chord pair
-        src[i, 1] = melody_token_to_id["pitch_60_on"]
-        src[i, 2] = melody_token_to_id["pitch_60_hold"]
-        tgt[i, 1] = chord_token_to_id["C:4-3/0_on"]
-        tgt[i, 2] = chord_token_to_id["C:4-3/0_hold"]
+        # A short melody/chord pair in unified ID space
+        src[i, 1] = unified_token_to_id["pitch_60_on"]
+        src[i, 2] = unified_token_to_id["pitch_60_hold"]
+        tgt[i, 1] = unified_token_to_id["C:4-3/0_on"]
+        tgt[i, 2] = unified_token_to_id["C:4-3/0_hold"]
         # EOS at position 3
         eos_idx = 3
         src[i, eos_idx] = cfg.eos_id
@@ -99,12 +118,11 @@ def test_offline_main_smoke(tmp_path) -> None:
     melody_vocab, chord_vocab = _create_offline_test_data(data_dir, d_cfg, n_samples=3)
 
     # Build and save a tiny model checkpoint matching the configs above.
-    # The evaluation code now operates in unified ID space, so we instantiate
-    # the model with the unified vocab size derived from the composed vocab.
-    vocab_size = max(
-        max(melody_vocab.values(), default=0),
-        max(chord_vocab.values(), default=0),
-    ) + 1
+    # The evaluation code operates in unified ID space, so we instantiate the
+    # model with the unified vocab size derived from the unified vocab file.
+    with (data_dir / "vocab_unified.json").open() as f:
+        unified = json.load(f)["token_to_id"]
+    vocab_size = max(unified.values(), default=0) + 1
     model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
     checkpoint_path = tmp_path / "offline_test_model.pt"
     torch.save(model.state_dict(), checkpoint_path)

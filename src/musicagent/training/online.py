@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
     """Create a linear learning rate schedule with warmup."""
+
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -33,6 +34,7 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
             float(num_training_steps - current_step)
             / float(max(1, num_training_steps - num_warmup_steps)),
         )
+
     return LambdaLR(optimizer, lr_lambda)
 
 
@@ -86,10 +88,7 @@ def train_epoch(
         output = model(inputs)
 
         # Flatten for loss computation
-        loss = criterion(
-            output.reshape(-1, output.size(-1)),
-            targets.reshape(-1)
-        )
+        loss = criterion(output.reshape(-1, output.size(-1)), targets.reshape(-1))
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -112,12 +111,15 @@ def train_epoch(
             )
 
             if use_wandb:
-                wandb.log({
-                    "train/loss": cur_loss,
-                    "train/lr": lr,
-                    "train/ms_per_batch": ms_per_batch,
-                    "train/epoch": epoch,
-                }, step=global_step)
+                wandb.log(
+                    {
+                        "train/loss": cur_loss,
+                        "train/lr": lr,
+                        "train/ms_per_batch": ms_per_batch,
+                        "train/epoch": epoch,
+                    },
+                    step=global_step,
+                )
 
             total_loss = 0.0
             start_time = time.time()
@@ -211,8 +213,8 @@ def train_online(args: argparse.Namespace) -> None:
     logger.info(f"Using device: {device}")
 
     try:
-        train_ds = OnlineDataset(d_cfg, split='train')
-        valid_ds = OnlineDataset(d_cfg, split='valid')
+        train_ds = OnlineDataset(d_cfg, split="train")
+        valid_ds = OnlineDataset(d_cfg, split="valid")
     except FileNotFoundError as e:
         logger.error(e)
         return
@@ -315,33 +317,42 @@ def train_online(args: argparse.Namespace) -> None:
         wandb.define_metric("valid/loss", summary="min")
         wandb.define_metric("valid/perplexity", summary="min")
 
-    best_val_loss = float('inf')
+    best_val_loss = float("inf")
     global_step = 0
 
     for epoch in range(1, args.epochs + 1):
         global_step = train_epoch(
-            model, train_loader, optimizer, scheduler, criterion,
-            device, epoch, global_step, use_wandb
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            criterion,
+            device,
+            epoch,
+            global_step,
+            use_wandb,
         )
         val_loss = evaluate(model, valid_loader, criterion, device)
         try:
             val_ppl = math.exp(min(val_loss, 100))
         except OverflowError:
-            val_ppl = float('inf')
+            val_ppl = float("inf")
 
         logger.info("-" * 89)
         logger.info(
-            f"| End of epoch {epoch} | valid loss {val_loss:.4f} | "
-            f"perplexity {val_ppl:.2f}"
+            f"| End of epoch {epoch} | valid loss {val_loss:.4f} | perplexity {val_ppl:.2f}"
         )
         logger.info("-" * 89)
 
         if use_wandb:
-            wandb.log({
-                "valid/loss": val_loss,
-                "valid/perplexity": val_ppl,
-                "valid/epoch": epoch,
-            }, step=global_step)
+            wandb.log(
+                {
+                    "valid/loss": val_loss,
+                    "valid/perplexity": val_ppl,
+                    "valid/epoch": epoch,
+                },
+                step=global_step,
+            )
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -363,7 +374,7 @@ def train_online(args: argparse.Namespace) -> None:
                 try:
                     wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
                 except OverflowError:
-                    wandb.run.summary["best_val_perplexity"] = float('inf')
+                    wandb.run.summary["best_val_perplexity"] = float("inf")
                 wandb.run.summary["best_epoch"] = epoch
 
                 artifact = wandb.Artifact(
@@ -425,4 +436,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -12,4 +12,3 @@ __all__ = [
     "make_offline_collate_fn",
     "make_online_collate_fn",
 ]
-

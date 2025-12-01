@@ -32,4 +32,3 @@ def test_seed_everything_different_seeds() -> None:
     rand2 = random.random()
 
     assert rand1 != rand2
-

@@ -15,11 +15,11 @@ class DataConfig:
     data_processed: Path = Path("realchords_data")
 
     # Constants
-    frame_rate: int = 4       # 16th notes
+    frame_rate: int = 4  # 16th notes
     center_midi: int = 60
-    max_len: int = 256        # Model Input Length
-    storage_len: int = 1024   # Disk Storage Length (to allow random cropping)
-    max_transpose: int = 6    # Maximum semitone shift for data augmentation and vocab building
+    max_len: int = 256  # Model Input Length
+    storage_len: int = 1024  # Disk Storage Length (to allow random cropping)
+    max_transpose: int = 6  # Maximum semitone shift for data augmentation and vocab building
 
     # Tokens
     pad_token: str = "<pad>"
@@ -55,13 +55,8 @@ class OfflineConfig:
     Encoder-decoder architecture.
     """
 
-    # Architecture (matches ReaLchords offline model: 8-layer encoder–decoder,
-    # hidden size 512, 6 attention heads).
+    # Architecture.
     d_model: int = 512
-    # Number of attention heads. Must divide d_model for all transformer
-    # implementations we use (including Hugging Face's T5). The previous
-    # default of 6 caused a runtime error in training smoke tests because
-    # 512 % 6 != 0; we set 8 here so the default configuration is valid.
     n_heads: int = 8
     n_layers: int = 8
     dropout: float = 0.1
@@ -71,10 +66,7 @@ class OfflineConfig:
     lr: float = 1e-3
     warmup_steps: int = 1000
 
-    device: str = field(default_factory=lambda: (
-        "cuda" if torch.cuda.is_available()
-        else "cpu"
-    ))
+    device: str = field(default_factory=lambda: ("cuda" if torch.cuda.is_available() else "cpu"))
 
 
 @dataclass
@@ -101,10 +93,7 @@ class OnlineConfig:
     lr: float = 1e-3
     warmup_steps: int = 1000
 
-    device: str = field(default_factory=lambda: (
-        "cuda" if torch.cuda.is_available()
-        else "cpu"
-    ))
+    device: str = field(default_factory=lambda: ("cuda" if torch.cuda.is_available() else "cpu"))
 
 
 # Backward compatibility alias

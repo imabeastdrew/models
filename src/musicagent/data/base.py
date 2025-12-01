@@ -17,50 +17,31 @@ class BaseDataset(Dataset, ABC):
     """Abstract base class with shared vocabulary and transposition logic."""
 
     # Root names must match those used in preprocessing.ChordMapper.
-    ROOT_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B']
+    ROOT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
-    def __init__(self, config: DataConfig, split: str = 'train'):
+    def __init__(self, config: DataConfig, split: str = "train"):
         self.config = config
         self.split = split
 
-        # Whether sequences on disk are already stored in the unified ID space
-        # produced by preprocessing (True) or in the legacy per-track spaces
-        # (False, used mainly in tests / older data).
-        self.uses_unified_ids_on_disk: bool = config.vocab_unified.exists()
+        # In the current pipeline we require a unified vocabulary produced by
+        # ``scripts/preprocess.py``.
+        if not config.vocab_unified.exists():
+            raise FileNotFoundError(
+                f"Unified vocabulary not found at {config.vocab_unified}. "
+                "Please preprocess the dataset with scripts/preprocess.py "
+                "so that all sequences and vocabularies share a unified ID space."
+            )
 
-        # Load unified vocabulary created at preprocessing time when available.
-        # For backward compatibility with older tests or preprocessed data that
-        # only saved separate melody/chord vocabularies, we fall back to those
-        # files and reconstruct a unified view on the fly.
-        if self.uses_unified_ids_on_disk:
-            with open(config.vocab_unified) as f:
-                unified = json.load(f)
-            token_to_id: dict[str, int] = unified.get("token_to_id", {})
-        else:
-            # Backward-compatible path: compose a unified mapping from the
-            # original per-track vocabularies. We assume IDs are already
-            # consistent with the on-disk arrays and simply merge the dicts.
-            token_to_id = {}
-            with open(config.vocab_melody) as f:
-                melody_tok = json.load(f)["token_to_id"]
-            with open(config.vocab_chord) as f:
-                chord_tok = json.load(f)["token_to_id"]
-            token_to_id.update(melody_tok)
-            for tok, idx in chord_tok.items():
-                if tok in token_to_id and token_to_id[tok] != idx:
-                    logger.warning(
-                        "Unified vocab conflict when composing from per-track "
-                        "vocabs for token %s: melody=%d, chord=%d",
-                        tok,
-                        token_to_id[tok],
-                        idx,
-                    )
-                token_to_id.setdefault(tok, idx)
+        with open(config.vocab_unified) as f:
+            unified = json.load(f)
+        token_to_id: dict[str, int] = unified.get("token_to_id", {})
+
+        # For any legacy code paths that previously branched on this flag, make
+        # it explicit that we are always operating in unified-ID mode now.
+        self.uses_unified_ids_on_disk: bool = True
 
         self.unified_token_to_id: dict[str, int] = token_to_id
-        self.unified_id_to_token: dict[int, str] = {
-            idx: tok for tok, idx in token_to_id.items()
-        }
+        self.unified_id_to_token: dict[int, str] = {idx: tok for tok, idx in token_to_id.items()}
 
         # Expose unified vocab size for models that operate directly in this
         # space. We use 1 + max(ID) rather than len(token_to_id) to remain
@@ -276,4 +257,3 @@ def make_offline_collate_fn(pad_id: int = 0):
         return _collate_offline(batch, pad_id=pad_id)
 
     return _fn
-
