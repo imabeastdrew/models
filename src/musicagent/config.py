@@ -58,7 +58,11 @@ class OfflineConfig:
     # Architecture (matches ReaLchords offline model: 8-layer encoder–decoder,
     # hidden size 512, 6 attention heads).
     d_model: int = 512
-    n_heads: int = 6
+    # Number of attention heads. Must divide d_model for all transformer
+    # implementations we use (including Hugging Face's T5). The previous
+    # default of 6 caused a runtime error in training smoke tests because
+    # 512 % 6 != 0; we set 8 here so the default configuration is valid.
+    n_heads: int = 8
     n_layers: int = 8
     dropout: float = 0.1
 
@@ -87,7 +91,8 @@ class OnlineConfig:
     # Architecture (matches ReaLchords online model: 8-layer decoder-only,
     # hidden size 512, 6 attention heads).
     d_model: int = 512
-    n_heads: int = 6
+    # Must divide d_model; see OfflineConfig.n_heads comment above.
+    n_heads: int = 8
     n_layers: int = 8
     dropout: float = 0.1
 
