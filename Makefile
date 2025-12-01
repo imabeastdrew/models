@@ -10,6 +10,7 @@ help:
 	@echo "  typecheck  - Run mypy type checks"
 	@echo "  test       - Run pytest test suite"
 	@echo "  check      - Run lint, typecheck, and test"
+	@echo "  all        - Run sync, format, and full check pipeline"
 
 sync:
 	uv sync --dev
@@ -28,6 +29,6 @@ test:
 
 check: lint typecheck test
 
-all: check
+all: sync format check
 
 
