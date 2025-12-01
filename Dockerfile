@@ -17,7 +17,6 @@ ENV PATH="/workspace/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1
 
 COPY src ./src
-COPY scripts ./scripts
 
 RUN uv pip install -e . --no-deps
 
