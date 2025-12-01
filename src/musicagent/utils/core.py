@@ -5,7 +5,7 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import numpy as np
 import torch
@@ -70,12 +70,16 @@ def safe_load_state_dict(
     logger = logging.getLogger(__name__)
 
     try:
-        return torch.load(path, map_location=map_location, weights_only=True)
+        state = torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         # Older PyTorch: no ``weights_only`` argument.
         logger.warning(
             "torch.load(..., weights_only=True) is not supported in this "
             "PyTorch version; falling back to torch.load without weights_only."
         )
-        return torch.load(path, map_location=map_location)
+        state = torch.load(path, map_location=map_location)
+
+    # `torch.load` is typed as returning `Any`; at call sites we only ever use
+    # it for model state dicts, so we narrow the type here for static checking.
+    return cast(dict[str, Any], state)
 

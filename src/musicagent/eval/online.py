@@ -356,7 +356,6 @@ def main():
     )
 
     melody_vocab_size = test_ds.melody_vocab_size
-    chord_vocab_size = test_ds.chord_vocab_size
 
     # Load model in unified ID space
     vocab_size = test_ds.unified_vocab_size

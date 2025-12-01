@@ -23,7 +23,11 @@ import torch.nn as nn
 from transformers import (
     LogitsProcessor,
     LogitsProcessorList,
+)
+from transformers import (
     T5Config as Seq2SeqConfig,
+)
+from transformers import (
     T5ForConditionalGeneration as Seq2SeqForConditionalGeneration,
 )
 
@@ -44,7 +48,7 @@ class _ChordOnlyLogitsProcessor(LogitsProcessor):
         self._base_mask = mask.detach().clone().to("cpu", dtype=torch.float32)
         self._cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
-    def _mask_for(self, scores: torch.FloatTensor) -> torch.Tensor:
+    def _mask_for(self, scores: torch.Tensor) -> torch.Tensor:
         key = (scores.device, scores.dtype)
         if key not in self._cache:
             self._cache[key] = self._base_mask.to(scores.device, dtype=scores.dtype)
@@ -53,8 +57,8 @@ class _ChordOnlyLogitsProcessor(LogitsProcessor):
     def __call__(
         self,
         input_ids: torch.LongTensor,
-        scores: torch.FloatTensor,
-    ) -> torch.FloatTensor:
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
         mask = self._mask_for(scores)
         if mask.numel() == scores.size(-1):
             return scores + mask
@@ -157,7 +161,8 @@ class OfflineTransformer(nn.Module):
             return_dict=True,
         )
 
-        return outputs.logits
+        logits = cast(torch.Tensor, outputs.logits)
+        return logits
 
     @torch.no_grad()
     def generate(
@@ -186,9 +191,6 @@ class OfflineTransformer(nn.Module):
         Returns:
             (batch, generated_len) token IDs in the unified vocabulary.
         """
-        device = src.device
-        _, _ = src.size()
-
         encoder_attention_mask = src.ne(self.pad_id)
 
         # Logits processor for chord-only decoding (optional).
@@ -197,36 +199,34 @@ class OfflineTransformer(nn.Module):
         if mask.numel() == self.vocab_size:
             logits_processors.append(_ChordOnlyLogitsProcessor(mask))
 
-        # Delegate to Hugging Face's generate(), which uses KV caching.
-        # We explicitly pass ``decoder_start_token_id`` so that the caller's
-        # ``sos_id`` argument continues to control the start token and the
-        # behavior matches the previous manual loop.
-        gen_kwargs: dict[str, object] = {
-            "input_ids": src,
-            "attention_mask": encoder_attention_mask,
-            "max_new_tokens": max_len,
-            "eos_token_id": eos_id,
-            "pad_token_id": self.pad_id,
-            "decoder_start_token_id": sos_id,
-            "do_sample": sample,
-            "num_beams": 1,
-            "use_cache": True,
-        }
-        if sample and temperature != 1.0:
-            gen_kwargs["temperature"] = float(temperature)
-
+        # Delegate to Hugging Face's generate(), which uses KV caching. We pass
+        # arguments explicitly rather than via **kwargs so that static type
+        # checking can validate them against the ``GenerationMixin`` signature.
         generated = self.model.generate(
+            input_ids=src,
+            attention_mask=encoder_attention_mask,
+            max_new_tokens=max_len,
+            eos_token_id=eos_id,
+            pad_token_id=self.pad_id,
+            decoder_start_token_id=sos_id,
+            do_sample=sample,
+            num_beams=1,
+            use_cache=True,
+            temperature=float(temperature),
             logits_processor=logits_processors if len(logits_processors) > 0 else None,
-            **gen_kwargs,
         )
 
         # ``generated`` has shape (batch, seq_len_dec) including the initial
         # decoder start token. We drop that first token so the returned tensor
         # contains only the generated sequence, as in the previous
         # implementation.
-        if generated.size(1) > 0:
-            generated = generated[:, 1:]
+        from typing import cast as _cast
+
+        tensor_generated = cast(torch.Tensor, generated)
+
+        if tensor_generated.size(1) > 0:
+            tensor_generated = tensor_generated[:, 1:]
 
         # Ensure we never exceed ``max_len`` in the returned sequence.
-        return generated[:, :max_len]
+        return tensor_generated[:, :max_len]
 

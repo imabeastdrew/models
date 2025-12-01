@@ -14,6 +14,7 @@ At inference, we alternate between sampling y_t and feeding in the given
 melody token x_t, mirroring the training order.
 """
 
+import logging
 import random
 
 import numpy as np
@@ -21,6 +22,9 @@ import torch
 
 from musicagent.config import DataConfig
 from musicagent.data.base import BaseDataset
+
+
+logger = logging.getLogger(__name__)
 
 
 class OnlineDataset(BaseDataset):
@@ -86,26 +90,46 @@ class OnlineDataset(BaseDataset):
                 "check preprocessing and DataConfig settings."
             )
 
-        # Build unified vocabulary (melody tokens + chord tokens). If a unified
-        # vocabulary was saved at preprocessing time, its size should match the
-        # derived layout here.
-        self.melody_vocab_size = len(self.vocab_melody)
-        self.chord_vocab_size = len(self.vocab_chord)
+        # Build unified vocabulary (melody tokens + chord tokens).
+        #
+        # Tests (and legacy code paths) expect `melody_vocab_size` and
+        # `chord_vocab_size` to count **both** special tokens
+        # (<pad>/<sos>/<eos>/rest) and musical tokens, i.e. to match the sizes
+        # of the original per-track vocabularies created during preprocessing.
+        #
+        # `BaseDataset.vocab_melody` / `vocab_chord` intentionally exclude
+        # specials so that transposition only touches musical symbols. We add
+        # the shared special set back in when reporting the per-track sizes.
+        special_ids = {
+            self.config.pad_id,
+            self.config.sos_id,
+            self.config.eos_id,
+            self.config.rest_id,
+        }
+        # Treat all specials as present in both melody and chord vocabularies.
+        num_specials = len(special_ids)
+
+        self.melody_vocab_size = len(self.vocab_melody) + num_specials
+        self.chord_vocab_size = len(self.vocab_chord) + num_specials
         derived_unified_size = self.melody_vocab_size + self.chord_vocab_size
 
-        if getattr(self, "unified_vocab_size", None) is None:
-            self.unified_vocab_size = derived_unified_size
+        # For datasets preprocessed with a unified vocabulary on disk, the
+        # `BaseDataset` has already set `unified_vocab_size` from that file.
+        # We log if there is any unexpected mismatch. For older tests or data
+        # without a unified vocab, we define the unified size from the derived
+        # melody/chord layout.
+        if getattr(self, "uses_unified_ids_on_disk", False):
+            if hasattr(self, "unified_vocab_size"):
+                if self.unified_vocab_size != derived_unified_size:
+                    logger.warning(
+                        "Unified vocab size mismatch: derived=%d, loaded=%d",
+                        derived_unified_size,
+                        self.unified_vocab_size,
+                    )
+            else:
+                self.unified_vocab_size = derived_unified_size
         else:
-            # Sanity check: log if there is a mismatch between on-disk unified
-            # vocab and the composed melody/chord vocabs.
-            if self.unified_vocab_size != derived_unified_size:
-                from musicagent.data.base import logger
-
-                logger.warning(
-                    "Unified vocab size mismatch: derived=%d, loaded=%d",
-                    derived_unified_size,
-                    self.unified_vocab_size,
-                )
+            self.unified_vocab_size = derived_unified_size
 
     def _melody_to_unified(self, token_id: int) -> int:
         """Convert melody token ID to unified vocab ID.
