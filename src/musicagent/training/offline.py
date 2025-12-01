@@ -6,7 +6,6 @@ import logging
 import math
 import time
 from dataclasses import asdict
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -15,6 +14,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Adafactor
 
+from musicagent.cli import build_train_offline_parser
 from musicagent.config import DataConfig, OfflineConfig
 from musicagent.data import OfflineDataset, make_offline_collate_fn
 from musicagent.models import OfflineTransformer
@@ -387,38 +387,7 @@ def train_offline(args: argparse.Namespace) -> None:
 
 def main():
     """CLI entry point for offline training."""
-    parser = argparse.ArgumentParser(description="Train Offline Model")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--save-dir", type=Path, default=Path("checkpoints/offline"))
-    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
-    parser.add_argument("--wandb-project", type=str, default="musicagent")
-    parser.add_argument("--run-name", type=str, default=None, help="Custom wandb run name")
-    parser.add_argument(
-        "--resume-from",
-        type=Path,
-        default=None,
-        help="Path to a model checkpoint (.pt) to warm-start from.",
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Enable deterministic training.",
-    )
-    # Data hyperparameters
-    parser.add_argument("--max-len", type=int, help="Maximum input length.")
-    parser.add_argument("--storage-len", type=int, help="Sequence length on disk.")
-    parser.add_argument("--max-transpose", type=int, help="Max semitone shift.")
-    # Model / training hyperparameters
-    parser.add_argument("--d-model", type=int, help="Model dimension.")
-    parser.add_argument("--n-heads", type=int, help="Number of attention heads.")
-    parser.add_argument("--n-layers", type=int, help="Number of layers.")
-    parser.add_argument("--dropout", type=float, help="Dropout rate.")
-    parser.add_argument("--batch-size", type=int, help="Batch size.")
-    parser.add_argument("--lr", type=float, help="Learning rate.")
-    parser.add_argument("--warmup-steps", type=int, help="Warmup steps.")
-    parser.add_argument("--device", type=str, help="Device (cuda/cpu).")
-
+    parser = build_train_offline_parser()
     args = parser.parse_args()
     train_offline(args)
 

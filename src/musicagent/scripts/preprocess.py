@@ -1,7 +1,12 @@
-#!/usr/bin/env python3
-"""HookTheory JSON to arrays."""
+"""HookTheory JSON to arrays (preprocessing entry point).
 
-import argparse
+This module contains the preprocessing pipeline that converts the raw
+HookTheory dataset into numpy arrays and vocabularies used by the
+offline and online models, and exposes a CLI entry point.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import sys
@@ -11,17 +16,11 @@ from pathlib import Path
 import ijson
 import numpy as np
 from tqdm import tqdm
+from typing import DefaultDict
 
-# Add src to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
+from musicagent.cli import build_preprocess_parser
 from musicagent.config import DataConfig
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stderr)],
-)
 logger = logging.getLogger(__name__)
 
 
@@ -69,12 +68,14 @@ class ChordMapper:
         return f"{root}:{quality}/{inversion}"
 
 
-def get_transposed_pitch(pitch, semitones):
+def get_transposed_pitch(pitch: int, semitones: int) -> int:
     new_pitch = pitch + semitones
     return max(0, min(127, new_pitch))
 
 
 def process_dataset(config: DataConfig) -> None:
+    """Run the full preprocessing pipeline given a :class:`DataConfig`."""
+
     if not config.data_raw.exists():
         raise FileNotFoundError(f"{config.data_raw} does not exist")
 
@@ -85,8 +86,9 @@ def process_dataset(config: DataConfig) -> None:
     chord_vocab = Vocabulary("chord", config)
     chord_mapper = ChordMapper()
 
+    # ------------------------------------------------------------------
     # Pass 1: Build Vocabulary
-
+    # ------------------------------------------------------------------
     logger.info("Pass 1: Building Vocabulary...")
     with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Building Vocab"):
@@ -169,14 +171,14 @@ def process_dataset(config: DataConfig) -> None:
             unified_token_to_id[token] = melody_size + cid
 
     unified_path = config.vocab_unified
-    with open(unified_path, "w") as f:
+    with unified_path.open("w") as vocab_file:
         json.dump(
             {
                 "token_to_id": unified_token_to_id,
                 "melody_size": melody_size,
                 "chord_size": len(chord_vocab.token_to_id),
             },
-            f,
+            vocab_file,
             indent=2,
         )
     logger.info(
@@ -196,7 +198,10 @@ def process_dataset(config: DataConfig) -> None:
     # uses the same unified mapping.
     logger.info("Pass 2: Tokenizing to Numpy (unified IDs)...")
 
-    buffers = defaultdict(lambda: {"src": [], "tgt": []})
+    def _buffer_factory() -> dict[str, list[np.ndarray]]:
+        return {"src": [], "tgt": []}
+
+    buffers: DefaultDict[str, dict[str, list[np.ndarray]]] = defaultdict(_buffer_factory)
 
     with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Tokenizing"):
@@ -298,10 +303,10 @@ def process_dataset(config: DataConfig) -> None:
     logger.info("Preprocessing complete.")
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Preprocess HookTheory data to numpy arrays.")
-    parser.add_argument("--input", type=Path, help="Input JSON path")
-    parser.add_argument("--output", type=Path, help="Output directory")
+def main() -> None:
+    """Run preprocessing from the command line."""
+
+    parser = build_preprocess_parser()
     args = parser.parse_args()
 
     cfg = DataConfig()
@@ -311,3 +316,9 @@ if __name__ == "__main__":
         cfg.data_processed = args.output
 
     process_dataset(cfg)
+
+
+if __name__ == "__main__":
+    # Allow running as a module for local development:
+    #   python -m musicagent.scripts.preprocess ...
+    main()

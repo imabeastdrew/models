@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-import argparse
 import logging
 import math
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from musicagent.cli import build_eval_online_parser
 from musicagent.config import DataConfig, OnlineConfig
 from musicagent.data import OnlineDataset, make_online_collate_fn
 from musicagent.models import OnlineTransformer
@@ -273,26 +272,7 @@ def main():
     """Evaluate online model on test set."""
     from musicagent.utils import load_configs_from_dir
 
-    parser = argparse.ArgumentParser(description="Evaluate Online Model")
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=Path("checkpoints/online/best_model.pt"),
-        help="Path to model checkpoint",
-    )
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument(
-        "--sample",
-        action="store_true",
-        help="Sample from distribution instead of greedy decoding",
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Sampling temperature (only used with --sample)",
-    )
+    parser = build_eval_online_parser()
     args = parser.parse_args()
 
     setup_logging()

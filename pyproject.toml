@@ -20,6 +20,10 @@ dependencies = [
 musicagent-train = "musicagent.training:main"
 musicagent-train-offline = "musicagent.training.offline:main"
 musicagent-train-online = "musicagent.training.online:main"
+musicagent-preprocess = "musicagent.scripts.preprocess:main"
+musicagent-eval-offline = "musicagent.eval.offline:main"
+musicagent-eval-online = "musicagent.eval.online:main"
+musicagent-eval = "musicagent.eval:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/musicagent"]
