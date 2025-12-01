@@ -220,7 +220,6 @@ class OfflineTransformer(nn.Module):
         # decoder start token. We drop that first token so the returned tensor
         # contains only the generated sequence, as in the previous
         # implementation.
-        from typing import cast as _cast
 
         tensor_generated = cast(torch.Tensor, generated)
 

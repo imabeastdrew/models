@@ -23,7 +23,6 @@ import torch
 from musicagent.config import DataConfig
 from musicagent.data.base import BaseDataset
 
-
 logger = logging.getLogger(__name__)
 
 
