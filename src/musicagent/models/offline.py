@@ -1,107 +1,167 @@
-"""Offline transformer.
+"""Offline encoder–decoder transformer for chord generation.
 
-The offline model sees the complete melody before generating chords.
-It uses a standard encoder-decoder transformer architecture.
+The offline model sees the complete melody sequence before generating chords.
+
+This module provides an ``OfflineTransformer`` with a simple interface:
+
+- ``forward(src, tgt) -> logits`` where both ``src`` and ``tgt`` are integer
+  IDs in a unified vocabulary shared between melody and chord tokens.
+- ``generate(src, max_len, sos_id, eos_id, temperature, sample)`` which
+  returns generated token IDs in this same unified vocabulary.
+
+Internally we operate purely in this unified token space (mirroring the online
+model); higher-level utilities such as datasets and decoders are responsible
+for mapping between unified IDs and human-readable melody/chord tokens.
 """
+
+from __future__ import annotations
+
+from typing import cast
 
 import torch
 import torch.nn as nn
+from transformers import (
+    LogitsProcessor,
+    LogitsProcessorList,
+)
+from transformers import (
+    T5Config as Seq2SeqConfig,
+)
+from transformers import (
+    T5ForConditionalGeneration as Seq2SeqForConditionalGeneration,
+)
 
 from musicagent.config import DataConfig, OfflineConfig
-from musicagent.models.components import PositionalEncoding
+
+
+class _ChordOnlyLogitsProcessor(LogitsProcessor):
+    """Logits processor that masks out non-chord tokens during generation.
+
+    The processor keeps a CPU copy of the base mask and lazily materializes
+    per-(device, dtype) views to avoid device mismatches when the model is
+    moved (e.g., via ``model.to("cuda")``) and to reduce repeated transfers.
+    """
+
+    def __init__(self, mask: torch.Tensor):
+        # Store a canonical float32 CPU copy; per-device views are created
+        # on demand in ``_mask_for``.
+        self._base_mask = mask.detach().clone().to("cpu", dtype=torch.float32)
+        self._cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+    def _mask_for(self, scores: torch.Tensor) -> torch.Tensor:
+        key = (scores.device, scores.dtype)
+        if key not in self._cache:
+            self._cache[key] = self._base_mask.to(scores.device, dtype=scores.dtype)
+        return self._cache[key]
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = self._mask_for(scores)
+        if mask.numel() == scores.size(-1):
+            return scores + mask
+        return scores
 
 
 class OfflineTransformer(nn.Module):
-    """Encoder-decoder transformer for offline chord generation.
+    """Encoder–decoder transformer for offline chord generation.
 
-    Given a complete melody sequence, generates a chord sequence
-    autoregressively using teacher forcing during training.
+    The model operates purely in the unified token ID space emitted by
+    preprocessing. Both melody (encoder input) and chords (decoder input /
+    output) are represented as integer IDs in this shared vocabulary.
     """
 
     def __init__(
         self,
         model_config: OfflineConfig,
         data_config: DataConfig,
-        vocab_src_size: int,
-        vocab_tgt_size: int
+        vocab_size: int,
+        chord_token_ids: list[int] | None = None,
     ):
-        super().__init__()
-        self.cfg = model_config
-
-        self.src_embed = nn.Embedding(
-            vocab_src_size,
-            model_config.d_model,
-            padding_idx=data_config.pad_id,
-        )
-        self.tgt_embed = nn.Embedding(
-            vocab_tgt_size,
-            model_config.d_model,
-            padding_idx=data_config.pad_id,
-        )
-        self.pos_enc = PositionalEncoding(model_config.d_model, data_config.max_len)
-
-        self.transformer = nn.Transformer(
-            d_model=model_config.d_model,
-            nhead=model_config.n_heads,
-            num_encoder_layers=model_config.n_layers,
-            num_decoder_layers=model_config.n_layers,
-            dim_feedforward=model_config.d_model * 4,
-            dropout=model_config.dropout,
-            batch_first=True,
-            norm_first=True
-        )
-
-        self.fc_out = nn.Linear(model_config.d_model, vocab_tgt_size)
-        self.pad_id = data_config.pad_id
-
-    def create_mask(self, src: torch.Tensor, tgt: torch.Tensor):
-        """Create attention masks for transformer.
+        """Create an offline encoder–decoder model.
 
         Args:
-            src: Source tensor (batch, src_len)
-            tgt: Target tensor (batch, tgt_len)
-
-        Returns:
-            Tuple of (src_key_padding_mask, tgt_key_padding_mask, tgt_mask)
+            model_config: OfflineConfig with architecture hyperparameters.
+            data_config: DataConfig with token IDs (pad/sos/eos, max_len, ...).
+            vocab_size: Size of the unified token vocabulary.
+            chord_token_ids: Optional list of token IDs that correspond to
+                chord symbols. When provided, generation will be constrained
+                to this set (plus special tokens) by masking logits.
         """
-        src_key_padding_mask = (src == self.pad_id)
-        tgt_key_padding_mask = (tgt == self.pad_id)
+        super().__init__()
+        self.cfg = model_config
+        self.data_cfg = data_config
 
-        seq_len = tgt.size(1)
-        # Causal attention mask: True where positions should be masked.
-        # Shape: [tgt_len, tgt_len], with True above the main diagonal.
-        tgt_mask = torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=tgt.device),
-            diagonal=1,
+        self.vocab_size = vocab_size
+        self.pad_id = data_config.pad_id
+
+        # ------------------------------------------------------------------
+        # Logits mask for generation (optional chord-only decoding)
+        # ------------------------------------------------------------------
+        logits_mask = torch.zeros(self.vocab_size, dtype=torch.float32)
+        if chord_token_ids is not None:
+            # Disallow everything except chord tokens and a few special tokens.
+            mask = torch.full((self.vocab_size,), float("-inf"), dtype=torch.float32)
+            special_ids = {
+                self.pad_id,
+                data_config.sos_id,
+                data_config.eos_id,
+                data_config.rest_id,
+            }
+            for idx in special_ids:
+                if 0 <= idx < self.vocab_size:
+                    mask[idx] = 0.0
+            for idx in chord_token_ids:
+                if 0 <= idx < self.vocab_size:
+                    mask[idx] = 0.0
+            logits_mask = mask
+
+        self.register_buffer("logits_mask", logits_mask, persistent=False)
+
+        # Configure a compact encoder–decoder transformer matching our
+        # OfflineConfig dimensions. We keep the architecture close to the
+        # original paper: d_model=512, n_layers=8, etc., but allow overrides
+        # via OfflineConfig.
+        model_cfg = Seq2SeqConfig(
+            vocab_size=self.vocab_size,
+            d_model=model_config.d_model,
+            d_ff=model_config.d_model * 4,
+            num_heads=model_config.n_heads,
+            num_layers=model_config.n_layers,
+            num_decoder_layers=model_config.n_layers,
+            dropout_rate=model_config.dropout,
+            pad_token_id=self.pad_id,
+            eos_token_id=data_config.eos_id,
+            decoder_start_token_id=data_config.sos_id,
         )
 
-        return src_key_padding_mask, tgt_key_padding_mask, tgt_mask
+        self.model = Seq2SeqForConditionalGeneration(model_cfg)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
         """Forward pass with teacher forcing.
 
         Args:
-            src: Source melody tokens (batch, src_len)
-            tgt: Target chord tokens (batch, tgt_len)
+            src: Source melody tokens (batch, src_len) in unified vocab space.
+            tgt: Target chord tokens (batch, tgt_len) in unified vocab space.
 
         Returns:
-            Logits over target vocabulary (batch, tgt_len, vocab_tgt_size)
+            Logits over the unified vocabulary (batch, tgt_len, vocab_size).
         """
-        src_key_mask, tgt_key_mask, tgt_mask = self.create_mask(src, tgt)
-
-        src_emb = self.pos_enc(self.src_embed(src))
-        tgt_emb = self.pos_enc(self.tgt_embed(tgt))
-
-        out = self.transformer(
-            src=src_emb,
-            tgt=tgt_emb,
-            src_key_padding_mask=src_key_mask,
-            tgt_key_padding_mask=tgt_key_mask,
-            memory_key_padding_mask=src_key_mask,
-            tgt_mask=tgt_mask
+        outputs = self.model(
+            input_ids=src,
+            attention_mask=src.ne(self.pad_id),
+            decoder_input_ids=tgt,
+            use_cache=False,
+            return_dict=True,
         )
 
-        logits: torch.Tensor = self.fc_out(out)
+        logits = cast(torch.Tensor, outputs.logits)
         return logits
 
     @torch.no_grad()
@@ -114,69 +174,59 @@ class OfflineTransformer(nn.Module):
         temperature: float = 1.0,
         sample: bool = False,
     ) -> torch.Tensor:
-        """Autoregressively generate chord sequence given melody.
+        """Autoregressively generate a chord sequence given a melody.
+
+        This mirrors the original CLI/eval interface while delegating the heavy
+        lifting to :meth:`transformers.T5ForConditionalGeneration.generate`,
+        which uses the model's built-in KV cache for efficient decoding.
 
         Args:
-            src: (batch, src_len) melody token IDs
-            max_len: maximum output length
-            sos_id: start-of-sequence token ID
-            eos_id: end-of-sequence token ID
-            temperature: softmax temperature (ignored if sample=False)
-            sample: if True, sample from distribution; else greedy argmax
+            src: (batch, src_len) melody token IDs in unified vocab space.
+            max_len: Maximum number of chord tokens to generate.
+            sos_id: Start-of-sequence token ID in the unified vocabulary.
+            eos_id: End-of-sequence token ID in the unified vocabulary.
+            temperature: Softmax temperature (used only when ``sample=True``).
+            sample: If True, sample from the distribution; otherwise greedy.
 
         Returns:
-            (batch, generated_len) chord token IDs (including SOS)
+            (batch, generated_len) token IDs in the unified vocabulary.
         """
-        device = src.device
-        batch_size = src.size(0)
+        encoder_attention_mask = src.ne(self.pad_id)
 
-        # Pre-encode the source sequence once
-        src_key_padding_mask = (src == self.pad_id)
-        src_emb = self.pos_enc(self.src_embed(src))
-        memory = self.transformer.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+        # Logits processor for chord-only decoding (optional).
+        mask = cast(torch.Tensor, self.logits_mask)
+        logits_processors = LogitsProcessorList()
+        if mask.numel() == self.vocab_size:
+            logits_processors.append(_ChordOnlyLogitsProcessor(mask))
 
-        # Start with SOS token
-        generated = torch.full((batch_size, 1), sos_id, dtype=torch.long, device=device)
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        # Delegate to Hugging Face's generate(), which uses KV caching. We pass
+        # arguments explicitly rather than via **kwargs so that static type
+        # checking can validate them against the ``GenerationMixin`` signature.
+        generated = self.model.generate(
+            input_ids=src,
+            attention_mask=encoder_attention_mask,
+            max_new_tokens=max_len,
+            eos_token_id=eos_id,
+            pad_token_id=self.pad_id,
+            decoder_start_token_id=sos_id,
+            do_sample=sample,
+            num_beams=1,
+            use_cache=True,
+            temperature=float(temperature),
+            logits_processor=logits_processors if len(logits_processors) > 0 else None,
+        )
 
-        for _ in range(max_len - 1):
-            tgt_emb = self.pos_enc(self.tgt_embed(generated))
+        # ``generated`` has shape (batch, seq_len_dec) including the initial
+        # decoder start token. We drop that first token so the returned tensor
+        # contains only the generated sequence, as in the previous
+        # implementation.
+        from typing import cast as _cast
 
-            seq_len = generated.size(1)
-            tgt_mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
-                diagonal=1,
-            )
+        tensor_generated = cast(torch.Tensor, generated)
 
-            out = self.transformer.decoder(
-                tgt_emb,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_key_padding_mask=src_key_padding_mask,
-            )
+        if tensor_generated.size(1) > 0:
+            tensor_generated = tensor_generated[:, 1:]
 
-            logits = self.fc_out(out[:, -1, :])  # (batch, vocab)
-
-            if sample:
-                probs = torch.softmax(logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-
-            # For finished sequences, keep generating pad
-            next_token = torch.where(
-                finished.unsqueeze(1),
-                torch.full_like(next_token, self.pad_id),
-                next_token,
-            )
-
-            generated = torch.cat([generated, next_token], dim=1)
-
-            # Mark sequences that just produced EOS as finished
-            finished = finished | (next_token.squeeze(1) == eos_id)
-
-            if finished.all():
-                break
-
-        return generated
+        # Ensure we never exceed ``max_len`` in the returned sequence.
+        return tensor_generated[:, :max_len]
 

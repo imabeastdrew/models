@@ -10,10 +10,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from transformers import Adafactor
 
 from musicagent.config import DataConfig, OfflineConfig
 from musicagent.data import OfflineDataset, make_offline_collate_fn
@@ -72,7 +72,7 @@ def train_epoch(
         tgt_input = tgt[:, :-1]
         tgt_y = tgt[:, 1:]
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         output = model(src, tgt_input)
 
         loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
@@ -222,9 +222,24 @@ def train_offline(args: argparse.Namespace) -> None:
 
     vocab_src_len = len(train_ds.vocab_melody)
     vocab_tgt_len = len(train_ds.vocab_chord)
-    logger.info(f"Vocab Size: Src={vocab_src_len}, Tgt={vocab_tgt_len}")
+    unified_vocab_size = train_ds.unified_vocab_size
+    logger.info(
+        "Vocab Size: Melody=%d, Chord=%d, Unified=%d",
+        vocab_src_len,
+        vocab_tgt_len,
+        unified_vocab_size,
+    )
 
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_src_len, vocab_tgt_len).to(device)
+    # Offline model now operates directly in the unified token space. We also
+    # pass the set of chord token IDs so that generation can be constrained to
+    # chord symbols only.
+    chord_token_ids = sorted(train_ds.vocab_chord.values())
+    model = OfflineTransformer(
+        m_cfg,
+        d_cfg,
+        vocab_size=unified_vocab_size,
+        chord_token_ids=chord_token_ids,
+    ).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
 
@@ -240,7 +255,14 @@ def train_offline(args: argparse.Namespace) -> None:
                 "Continuing with randomly initialized weights."
             )
 
-    optimizer = optim.AdamW(model.parameters(), lr=m_cfg.lr, weight_decay=0.01)
+    # Adafactor optimizer, matching the paper's setup.
+    optimizer = Adafactor(
+        model.parameters(),
+        lr=m_cfg.lr,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+    )
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
 
     total_steps = len(train_loader) * args.epochs
@@ -263,7 +285,7 @@ def train_offline(args: argparse.Namespace) -> None:
                 "frame_rate": d_cfg.frame_rate,
                 "storage_len": d_cfg.storage_len,
                 "epochs": args.epochs,
-                "weight_decay": 0.01,
+                "weight_decay": 0.0,
                 "grad_clip": 0.5,
                 "vocab_src_size": vocab_src_len,
                 "vocab_tgt_size": vocab_tgt_len,

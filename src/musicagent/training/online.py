@@ -10,10 +10,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import wandb
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from transformers import Adafactor
 
 from musicagent.config import DataConfig, OnlineConfig
 from musicagent.data.online import OnlineDataset, make_online_collate_fn
@@ -82,7 +82,7 @@ def train_epoch(
         pad_id = model.pad_id
         targets[:, 1::2] = pad_id
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         output = model(inputs)
 
         # Flatten for loss computation
@@ -235,12 +235,18 @@ def train_online(args: argparse.Namespace) -> None:
     chord_vocab_size = train_ds.chord_vocab_size
     unified_vocab_size = train_ds.unified_vocab_size
     logger.info(
-        f"Vocab Size: Melody={melody_vocab_size}, Chord={chord_vocab_size}, "
-        f"Unified={unified_vocab_size}"
+        "Vocab Size: Melody=%d, Chord=%d, Unified=%d",
+        melody_vocab_size,
+        chord_vocab_size,
+        unified_vocab_size,
     )
 
+    chord_token_ids = sorted(train_ds.vocab_chord.values())
     model = OnlineTransformer(
-        m_cfg, d_cfg, melody_vocab_size, chord_vocab_size
+        m_cfg,
+        d_cfg,
+        vocab_size=unified_vocab_size,
+        chord_token_ids=chord_token_ids,
     ).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
@@ -257,7 +263,14 @@ def train_online(args: argparse.Namespace) -> None:
                 "Continuing with randomly initialized weights."
             )
 
-    optimizer = optim.AdamW(model.parameters(), lr=m_cfg.lr, weight_decay=0.01)
+    # Adafactor optimizer, matching the paper's setup.
+    optimizer = Adafactor(
+        model.parameters(),
+        lr=m_cfg.lr,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+    )
 
     # Use unified vocab's pad_id for loss masking
     # In the unified vocab, pad_id is the same as melody's pad_id (0)
@@ -285,7 +298,7 @@ def train_online(args: argparse.Namespace) -> None:
                 "frame_rate": d_cfg.frame_rate,
                 "storage_len": d_cfg.storage_len,
                 "epochs": args.epochs,
-                "weight_decay": 0.01,
+                "weight_decay": 0.0,
                 "grad_clip": 0.5,
                 "melody_vocab_size": melody_vocab_size,
                 "chord_vocab_size": chord_vocab_size,

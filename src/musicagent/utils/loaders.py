@@ -9,6 +9,7 @@ import torch
 from musicagent.config import DataConfig
 
 from .config import load_configs_from_dir
+from .core import safe_load_state_dict
 from .registry import ModelType, get_model_registry
 
 
@@ -58,16 +59,26 @@ def load_model_from_artifact(
     temp_ds: Any = reg.dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
 
     if model_type == "online":
+        vocab_size = temp_ds.unified_vocab_size
+        chord_token_ids = sorted(temp_ds.vocab_chord.values())
         model = reg.model_class(
-            m_cfg, d_cfg, temp_ds.melody_vocab_size, temp_ds.chord_vocab_size
+            m_cfg,
+            d_cfg,
+            vocab_size=vocab_size,
+            chord_token_ids=chord_token_ids,
         )
     else:
+        vocab_size = temp_ds.unified_vocab_size
+        chord_token_ids = sorted(temp_ds.vocab_chord.values())
         model = reg.model_class(
-            m_cfg, d_cfg, len(temp_ds.vocab_melody), len(temp_ds.vocab_chord)
+            m_cfg,
+            d_cfg,
+            vocab_size=vocab_size,
+            chord_token_ids=chord_token_ids,
         )
 
     model = model.to(device)
-    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    state = safe_load_state_dict(checkpoint_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
