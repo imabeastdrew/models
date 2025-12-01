@@ -9,14 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import ijson
 import numpy as np
 from tqdm import tqdm
-from typing import DefaultDict
 
 from musicagent.cli import build_preprocess_parser
 from musicagent.config import DataConfig
@@ -201,7 +199,7 @@ def process_dataset(config: DataConfig) -> None:
     def _buffer_factory() -> dict[str, list[np.ndarray]]:
         return {"src": [], "tgt": []}
 
-    buffers: DefaultDict[str, dict[str, list[np.ndarray]]] = defaultdict(_buffer_factory)
+    buffers: defaultdict[str, dict[str, list[np.ndarray]]] = defaultdict(_buffer_factory)
 
     with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Tokenizing"):
