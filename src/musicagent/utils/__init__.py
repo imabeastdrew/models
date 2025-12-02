@@ -1,6 +1,12 @@
 """Utilities for musicagent."""
 
-from .analysis import AdaptationDynamicsResult, compute_adaptation_dynamics
+from .analysis import (
+    AdaptationDynamicsResult,
+    HistogramStats,
+    compute_adaptation_dynamics,
+    compute_histograms_from_cached_predictions,
+    compute_test_set_histograms,
+)
 from .artifacts import ArtifactPaths, download_wandb_artifact
 from .config import load_configs_from_dir
 from .core import safe_load_state_dict, seed_everything, setup_logging
@@ -41,6 +47,9 @@ __all__ = [
     # Analysis
     "AdaptationDynamicsResult",
     "compute_adaptation_dynamics",
+    "HistogramStats",
+    "compute_histograms_from_cached_predictions",
+    "compute_test_set_histograms",
     # Visualization
     "format_tokens_for_display",
     "show_example",

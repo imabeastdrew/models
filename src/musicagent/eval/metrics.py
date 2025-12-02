@@ -250,6 +250,49 @@ def chord_length_entropy(lengths: Sequence[int], max_bin: int = 32) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Metric 4: Melody–Chord Root Harmonic Interval
+# ---------------------------------------------------------------------------
+
+
+def melody_chord_root_intervals(
+    melody_tokens: Sequence[str],
+    chord_tokens: Sequence[str],
+) -> list[int]:
+    """Compute melody–chord root harmonic intervals (in semitone pitch classes).
+
+    For each frame where both melody and chord are "real" (non-special) tokens,
+    we compute the interval between the melody pitch class and the chord *root*
+    pitch class::
+
+        interval = (melody_pc - root_pc) % 12
+
+    This yields values in [0, 11], where 0 means the melody is on the root,
+    4 a major third above the root, 7 a perfect fifth, etc. Frames where either
+    side is silent/special are skipped.
+    """
+    intervals: list[int] = []
+
+    for mel_tok, chd_tok in zip(melody_tokens, chord_tokens):
+        midi_pitch = parse_melody_token(mel_tok)
+        root, _ = parse_chord_token(chd_tok)
+
+        if midi_pitch is None or root is None:
+            continue
+
+        try:
+            root_pc = PITCH_CLASSES.index(root)
+        except ValueError:
+            # Unknown root – treat as no valid chord in this frame.
+            continue
+
+        melody_pc = midi_pitch % 12
+        interval = (melody_pc - root_pc) % 12
+        intervals.append(interval)
+
+    return intervals
+
+
+# ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
 

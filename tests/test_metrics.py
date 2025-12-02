@@ -10,6 +10,7 @@ from musicagent.eval.metrics import (
     chord_pitch_classes,
     earth_movers_distance,
     histogram,
+    melody_chord_root_intervals,
     note_in_chord_ratio,
     onset_interval_emd,
     onset_intervals,
@@ -174,3 +175,30 @@ def test_chord_lengths_and_entropy() -> None:
     entropy = chord_length_entropy(lengths)
     # Two distinct lengths with equal probability → entropy = ln(2)
     assert np.isclose(entropy, math.log(2.0))
+
+
+def test_melody_chord_root_intervals_basic() -> None:
+    """melody_chord_root_intervals should measure PC distance to chord root."""
+    melody_tokens = [
+        "pitch_60_on",  # C4  → pc 0
+        "pitch_64_on",  # E4  → pc 4
+        "pitch_67_on",  # G4  → pc 7
+    ]
+    chord_tokens = [
+        "C:0-4-7/0_on",
+        "C:0-4-7/0_hold",
+        "C:0-4-7/0_hold",
+    ]
+
+    intervals = melody_chord_root_intervals(melody_tokens, chord_tokens)
+    assert intervals == [0, 4, 7]
+
+
+def test_melody_chord_root_intervals_skips_special_frames() -> None:
+    """Special melody/chord frames should be skipped."""
+    melody_tokens = ["<pad>", "pitch_60_on", "rest"]
+    # Only the middle frame has both valid melody and chord.
+    chord_tokens = ["C:0-4-7/0_on", "C:0-4-7/0_on", "<pad>"]
+
+    intervals = melody_chord_root_intervals(melody_tokens, chord_tokens)
+    assert intervals == [0]

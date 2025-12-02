@@ -15,7 +15,7 @@ from musicagent.cli import build_eval_online_parser
 from musicagent.config import DataConfig, OnlineConfig
 from musicagent.data import OnlineDataset, make_online_collate_fn
 from musicagent.models import OnlineTransformer
-from musicagent.utils import safe_load_state_dict, setup_logging
+from musicagent.utils.core import safe_load_state_dict, setup_logging
 
 from .metrics import (
     chord_length_entropy,
