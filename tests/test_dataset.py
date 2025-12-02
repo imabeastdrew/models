@@ -401,3 +401,169 @@ def test_online_dataset_filters_zero_frame_sequences(tmp_path: Path) -> None:
     # Interleaved sequence for a single frame should have length 3:
     # [SOS_chord, y1_chord, x1_melody]
     assert input_ids.shape[0] == 3
+
+
+def test_offline_dataset_always_starts_with_sos(tmp_path: Path) -> None:
+    """OfflineDataset should always return sequences starting with SOS."""
+    cfg = DataConfig(data_processed=tmp_path, storage_len=64, max_len=16)
+    _create_test_dataset(tmp_path, cfg, n_samples=10)
+
+    # Test train split (with random cropping)
+    ds_train = OfflineDataset(cfg, split="train")
+    for i in range(len(ds_train)):
+        for _ in range(5):  # Multiple samples to test random cropping
+            sample = ds_train[i]
+            assert sample["src"][0].item() == cfg.sos_id, (
+                f"Train src should start with SOS, got {sample['src'][0].item()}"
+            )
+            assert sample["tgt"][0].item() == cfg.sos_id, (
+                f"Train tgt should start with SOS, got {sample['tgt'][0].item()}"
+            )
+
+    # Test valid split (no augmentation)
+    ds_valid = OfflineDataset(cfg, split="valid")
+    for i in range(len(ds_valid)):
+        sample = ds_valid[i]
+        assert sample["src"][0].item() == cfg.sos_id, (
+            f"Valid src should start with SOS, got {sample['src'][0].item()}"
+        )
+        assert sample["tgt"][0].item() == cfg.sos_id, (
+            f"Valid tgt should start with SOS, got {sample['tgt'][0].item()}"
+        )
+
+
+def test_offline_dataset_always_ends_with_eos(tmp_path: Path) -> None:
+    """OfflineDataset should always return sequences ending with EOS."""
+    cfg = DataConfig(data_processed=tmp_path, storage_len=64, max_len=16)
+    _create_test_dataset(tmp_path, cfg, n_samples=10)
+
+    # Test train split (with random cropping)
+    ds_train = OfflineDataset(cfg, split="train")
+    for i in range(len(ds_train)):
+        for _ in range(5):  # Multiple samples to test random cropping
+            sample = ds_train[i]
+            assert sample["src"][-1].item() == cfg.eos_id, (
+                f"Train src should end with EOS, got {sample['src'][-1].item()}"
+            )
+            assert sample["tgt"][-1].item() == cfg.eos_id, (
+                f"Train tgt should end with EOS, got {sample['tgt'][-1].item()}"
+            )
+
+    # Test valid split (no augmentation)
+    ds_valid = OfflineDataset(cfg, split="valid")
+    for i in range(len(ds_valid)):
+        sample = ds_valid[i]
+        assert sample["src"][-1].item() == cfg.eos_id, (
+            f"Valid src should end with EOS, got {sample['src'][-1].item()}"
+        )
+        assert sample["tgt"][-1].item() == cfg.eos_id, (
+            f"Valid tgt should end with EOS, got {sample['tgt'][-1].item()}"
+        )
+
+
+def test_offline_dataset_frame_alignment_after_crop(tmp_path: Path) -> None:
+    """After random cropping, src and tgt should remain frame-aligned."""
+    cfg = DataConfig(data_processed=tmp_path, storage_len=64, max_len=16, max_transpose=0)
+
+    # Create dataset with distinct tokens at each frame position
+    melody_token_to_id: dict[str, int] = {
+        cfg.pad_token: cfg.pad_id,
+        cfg.sos_token: cfg.sos_id,
+        cfg.eos_token: cfg.eos_id,
+        cfg.rest_token: cfg.rest_id,
+    }
+    for midi in range(48, 84):
+        melody_token_to_id[f"pitch_{midi}_on"] = len(melody_token_to_id)
+        melody_token_to_id[f"pitch_{midi}_hold"] = len(melody_token_to_id)
+
+    chord_token_to_id: dict[str, int] = {
+        cfg.pad_token: cfg.pad_id,
+        cfg.sos_token: cfg.sos_id,
+        cfg.eos_token: cfg.eos_id,
+        cfg.rest_token: cfg.rest_id,
+    }
+    roots = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+    for root in roots:
+        chord_token_to_id[f"{root}:4-3/0_on"] = len(chord_token_to_id)
+        chord_token_to_id[f"{root}:4-3/0_hold"] = len(chord_token_to_id)
+
+    unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
+
+    # Create a sequence where frame i has pitch_(48+i) and chord root i%12
+    # This lets us verify alignment by checking that frame indices match
+    n_frames = 30  # More than max_len to force cropping
+    src = np.full((1, cfg.storage_len), cfg.pad_id, dtype=np.int32)
+    tgt = np.full((1, cfg.storage_len), cfg.pad_id, dtype=np.int32)
+
+    src[0, 0] = cfg.sos_id
+    tgt[0, 0] = cfg.sos_id
+
+    for frame_idx in range(n_frames):
+        pitch = 48 + frame_idx
+        root = roots[frame_idx % 12]
+        src[0, frame_idx + 1] = unified_ids[f"pitch_{pitch}_on"]
+        tgt[0, frame_idx + 1] = unified_ids[f"{root}:4-3/0_on"]
+
+    src[0, n_frames + 1] = cfg.eos_id
+    tgt[0, n_frames + 1] = cfg.eos_id
+
+    np.save(cfg.data_processed / "train_src.npy", src)
+    np.save(cfg.data_processed / "train_tgt.npy", tgt)
+
+    ds = OfflineDataset(cfg, split="train")
+
+    # Run multiple times to test different random crops
+    for _ in range(20):
+        sample = ds[0]
+        src_seq = sample["src"].numpy()
+        tgt_seq = sample["tgt"].numpy()
+
+        # Skip SOS at position 0, stop before EOS at the end
+        # Frames are at positions 1 to len-2
+        for pos in range(1, len(src_seq) - 1):
+            src_token = src_seq[pos]
+            tgt_token = tgt_seq[pos]
+
+            # Find which frame index this corresponds to by parsing the pitch
+            src_token_str = None
+            for tok, tok_id in unified_ids.items():
+                if tok_id == src_token:
+                    src_token_str = tok
+                    break
+
+            tgt_token_str = None
+            for tok, tok_id in unified_ids.items():
+                if tok_id == tgt_token:
+                    tgt_token_str = tok
+                    break
+
+            if src_token_str and src_token_str.startswith("pitch_"):
+                # Extract pitch and compute expected frame index
+                pitch = int(src_token_str.split("_")[1])
+                expected_frame_idx = pitch - 48
+                expected_root = roots[expected_frame_idx % 12]
+                expected_chord = f"{expected_root}:4-3/0_on"
+
+                assert tgt_token_str == expected_chord, (
+                    f"Frame alignment broken at pos {pos}: "
+                    f"src has pitch {pitch} (frame {expected_frame_idx}), "
+                    f"expected chord {expected_chord}, got {tgt_token_str}"
+                )
+
+
+def test_offline_dataset_sequence_length_with_sos_eos(tmp_path: Path) -> None:
+    """Sequence length should be at most max_len and include SOS + EOS."""
+    cfg = DataConfig(data_processed=tmp_path, storage_len=64, max_len=16)
+    _create_test_dataset(tmp_path, cfg, n_samples=5)
+
+    ds = OfflineDataset(cfg, split="train")
+    for i in range(len(ds)):
+        for _ in range(5):
+            sample = ds[i]
+            # Length should be at most max_len
+            assert sample["src"].shape[0] <= cfg.max_len
+            assert sample["tgt"].shape[0] <= cfg.max_len
+
+            # Should have at least SOS + EOS (length >= 2)
+            assert sample["src"].shape[0] >= 2
+            assert sample["tgt"].shape[0] >= 2
