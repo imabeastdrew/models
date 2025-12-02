@@ -41,11 +41,7 @@ class DataConfig:
 
 @dataclass
 class OfflineConfig:
-    """Config for offline transformer.
-
-    The offline model sees the complete melody before generating chords.
-    Encoder-decoder architecture.
-    """
+    """Config for offline transformer."""
 
     # Architecture.
     d_model: int = 512
@@ -63,14 +59,7 @@ class OfflineConfig:
 
 @dataclass
 class OnlineConfig:
-    """Configuration for online decoder-only transformer.
-
-    The online model generates chords without seeing the current or future
-    melody. It uses a decoder-only architecture with interleaved input
-    [SOS, y₁, x₁, y₂, x₂, ...] and causal attention. During training we
-    only optimize chord positions (y_t); melody tokens are used purely as
-    conditioning context and are not included in the loss.
-    """
+    """Config for online transformer."""
 
     # Architecture.
     d_model: int = 512
@@ -84,7 +73,3 @@ class OnlineConfig:
     warmup_steps: int = 1000
 
     device: str = field(default_factory=lambda: ("cuda" if torch.cuda.is_available() else "cpu"))
-
-
-# Backward compatibility alias
-ModelConfig = OfflineConfig

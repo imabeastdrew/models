@@ -122,10 +122,9 @@ def evaluate(model, loader, criterion, device):
     """Evaluate model on validation/test set.
 
     Note:
-        The returned loss is the *mean of per-batch cross-entropies*, i.e.
+        The returned loss is the mean of per-batch cross-entropies, i.e.
         effectively averaged per sample, not strictly normalized by the total
-        number of (non-ignored) tokens. This is sufficient for tracking
-        training progress but is not a calibrated per-token NLL.
+        number of (non-ignored) tokens.
     """
     model.eval()
     total_loss = 0.0

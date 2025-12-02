@@ -39,10 +39,6 @@ class BaseDataset(Dataset, ABC):
             unified = json.load(f)
         token_to_id: dict[str, int] = unified.get("token_to_id", {})
 
-        # For any legacy code paths that previously branched on this flag, make
-        # it explicit that we are always operating in unified-ID mode now.
-        self.uses_unified_ids_on_disk: bool = True
-
         self.unified_token_to_id: dict[str, int] = token_to_id
         self.unified_id_to_token: dict[int, str] = {idx: tok for tok, idx in token_to_id.items()}
 
@@ -70,16 +66,6 @@ class BaseDataset(Dataset, ABC):
                 self.vocab_melody[tok] = idx
             elif tok.endswith("_on") or tok.endswith("_hold"):
                 self.vocab_chord[tok] = idx
-
-        # Expose per-track vocab sizes for convenience (used in training,
-        # evaluation utilities and tests). These counts intentionally exclude
-        # special tokens such as <pad>/<sos>/<eos>/rest.
-        self.melody_vocab_size: int = len(self.vocab_melody)
-        self.chord_vocab_size: int = len(self.vocab_chord)
-
-        # Reverse mappings for on-the-fly transposition.
-        self.id_to_melody = {v: k for k, v in self.vocab_melody.items()}
-        self.id_to_chord = {v: k for k, v in self.vocab_chord.items()}
 
         self._build_transposition_tables()
 
