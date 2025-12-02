@@ -62,7 +62,7 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}/realchords_data:/workspace/realchords_data" \
             musicagent-ci \
-            --epochs 1 \
+            --max-steps 10\
             --no-wandb \
             --deterministic \
             --max-len 64 \
