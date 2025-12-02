@@ -82,7 +82,7 @@ def _create_dummy_data(data_dir: Path, cfg: DataConfig):
 def test_train_main_integration(tmp_path):
     """
     End-to-end integration test for training.offline.main().
-    Runs 1 epoch with minimal data to ensure no crashes.
+    Runs a small number of optimizer steps with minimal data to ensure no crashes.
     """
     # Setup dummy data
     data_dir = tmp_path / "realchords_data"
@@ -93,8 +93,8 @@ def test_train_main_integration(tmp_path):
     # Mock sys.argv
     test_args = [
         "musicagent-train",
-        "--epochs",
-        "1",
+        "--max-steps",
+        "5",
         "--save-dir",
         str(checkpoints_dir),
         "--no-wandb",

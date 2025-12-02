@@ -1,4 +1,4 @@
-"""Tests for offline evaluation module."""
+"""Tests for online evaluation module."""
 
 import json
 import sys
@@ -8,9 +8,9 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from musicagent.config import DataConfig, OfflineConfig
-from musicagent.eval import offline as eval_offline
-from musicagent.models import OfflineTransformer
+from musicagent.config import DataConfig, OnlineConfig
+from musicagent.eval import online as eval_online
+from musicagent.models import OnlineTransformer
 
 
 def _write_vocab(path: Path, token_to_id: dict[str, int]) -> None:
@@ -19,10 +19,19 @@ def _write_vocab(path: Path, token_to_id: dict[str, int]) -> None:
         json.dump({"token_to_id": token_to_id}, f)
 
 
-def _create_offline_test_data(
+def _create_online_test_data(
     tmp_path: Path, cfg: DataConfig, n_samples: int = 3
 ) -> tuple[dict[str, int], dict[str, int]]:
-    """Create a dummy dataset that matches the real preprocessing format."""
+    """Create a dummy dataset that matches the real preprocessing format.
+
+    This mirrors the unified‑vocab layout used by the preprocessing pipeline:
+    sequences on disk are stored in a single unified ID space with:
+
+        index 0      : SOS
+        indices 1..k : frame‑aligned tokens
+        index k+1    : EOS
+        >k+1         : PAD
+    """
     # Melody vocab: special tokens + a single pitch
     melody_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
@@ -90,8 +99,8 @@ def _create_offline_test_data(
     return melody_token_to_id, chord_token_to_id
 
 
-def test_offline_main_smoke(tmp_path) -> None:
-    """End-to-end test for musicagent.eval.offline.main() on a tiny dummy dataset.
+def test_online_main_smoke(tmp_path: Path) -> None:
+    """End-to-end test for musicagent.eval.online.main() on a tiny dummy dataset.
 
     The dummy dataset and vocabs match the real preprocessing format
     (pitch and chord token naming, SOS/EOS/pad/rest handling, and storage layout),
@@ -102,7 +111,7 @@ def test_offline_main_smoke(tmp_path) -> None:
 
     # Small configs for a lightweight test run.
     d_cfg = DataConfig(data_processed=data_dir, max_len=16, storage_len=32)
-    m_cfg = OfflineConfig(
+    m_cfg = OnlineConfig(
         d_model=32,
         n_heads=4,
         n_layers=2,
@@ -112,7 +121,7 @@ def test_offline_main_smoke(tmp_path) -> None:
         warmup_steps=10,
     )
 
-    melody_vocab, chord_vocab = _create_offline_test_data(data_dir, d_cfg, n_samples=3)
+    _create_online_test_data(data_dir, d_cfg, n_samples=3)
 
     # Build and save a tiny model checkpoint matching the configs above.
     # The evaluation code operates in unified ID space, so we instantiate the
@@ -120,13 +129,13 @@ def test_offline_main_smoke(tmp_path) -> None:
     with (data_dir / "vocab_unified.json").open() as f:
         unified = json.load(f)["token_to_id"]
     vocab_size = max(unified.values(), default=0) + 1
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
-    checkpoint_path = tmp_path / "offline_test_model.pt"
+    model = OnlineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
+    checkpoint_path = tmp_path / "online_test_model.pt"
     torch.save(model.state_dict(), checkpoint_path)
 
-    # Simulate CLI args to point offline.main() at our dummy checkpoint and CPU.
+    # Simulate CLI args to point online.main() at our dummy checkpoint and CPU.
     test_args = [
-        "musicagent-eval-offline",
+        "musicagent-eval-online",
         "--checkpoint",
         str(checkpoint_path),
         "--batch-size",
@@ -136,8 +145,8 @@ def test_offline_main_smoke(tmp_path) -> None:
     ]
 
     with (
-        patch("musicagent.eval.offline.DataConfig") as mock_data_config,
-        patch("musicagent.eval.offline.OfflineConfig") as mock_model_config,
+        patch("musicagent.eval.online.DataConfig") as mock_data_config,
+        patch("musicagent.eval.online.OnlineConfig") as mock_model_config,
         patch.object(sys, "argv", test_args),
     ):
         mock_data_config.return_value = d_cfg
@@ -145,4 +154,4 @@ def test_offline_main_smoke(tmp_path) -> None:
 
         # The test passes if main() runs without raising and
         # completes a full evaluation pass over the dummy test set.
-        eval_offline.main()
+        eval_online.main()

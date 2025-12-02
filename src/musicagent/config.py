@@ -34,14 +34,6 @@ class DataConfig:
     rest_id: int = 3
 
     @property
-    def vocab_melody(self) -> Path:
-        return self.data_processed / "vocab_melody.json"
-
-    @property
-    def vocab_chord(self) -> Path:
-        return self.data_processed / "vocab_chord.json"
-
-    @property
     def vocab_unified(self) -> Path:
         """Path to unified (melody + chord) vocabulary."""
         return self.data_processed / "vocab_unified.json"
@@ -80,10 +72,8 @@ class OnlineConfig:
     conditioning context and are not included in the loss.
     """
 
-    # Architecture (matches ReaLchords online model: 8-layer decoder-only,
-    # hidden size 512, 6 attention heads).
+    # Architecture.
     d_model: int = 512
-    # Must divide d_model; see OfflineConfig.n_heads comment above.
     n_heads: int = 8
     n_layers: int = 8
     dropout: float = 0.1

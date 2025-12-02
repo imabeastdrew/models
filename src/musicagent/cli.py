@@ -16,7 +16,15 @@ def _build_train_parser(description: str, default_save_dir: Path) -> argparse.Ar
     parser = argparse.ArgumentParser(description=description)
 
     # General training options
-    parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of optimizer steps. Training is purely step-based "
+            "and stops once this many optimizer steps have been taken."
+        ),
+    )
     parser.add_argument(
         "--save-dir",
         type=Path,

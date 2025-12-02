@@ -11,13 +11,210 @@ inference time, we only use the chord predictions while feeding in the given
 melody tokens.
 """
 
+import math
 from typing import cast
 
 import torch
 import torch.nn as nn
 
 from musicagent.config import DataConfig, OnlineConfig
-from musicagent.models.components import PositionalEncoding
+
+
+class RMSNorm(nn.Module):
+    """Root-mean-square LayerNorm without mean subtraction."""
+
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., d_model)
+        norm = x.pow(2).mean(dim=-1, keepdim=True)
+        return self.weight * x * torch.rsqrt(norm + self.eps)
+
+
+class RelativePositionBias(nn.Module):
+    """Relative position bias for self-attention."""
+
+    def __init__(self, num_buckets: int, max_distance: int, num_heads: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.num_heads = num_heads
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
+
+    def _relative_position_bucket(self, relative_position: torch.Tensor) -> torch.Tensor:
+        """Translate relative position to a bucket number (T5-style)."""
+        num_buckets = self.num_buckets
+        max_distance = self.max_distance
+        n = -relative_position
+        n = torch.abs(n)
+
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
+        val_if_large = max_exact + (
+            (
+                (torch.log(n.float() / max_exact) / math.log(max_distance / max_exact))
+                * (num_buckets - max_exact)
+            ).to(torch.long)
+        )
+        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+        # torch.where is typed as returning Any in some torch stubs; cast for mypy.
+        ret = torch.where(is_small, n, val_if_large)
+        return cast(torch.Tensor, ret)
+
+    def forward(
+        self, seq_len: int, device: torch.device, past_key_values_length: int = 0
+    ) -> torch.Tensor:
+        """Return bias tensor of shape (1, num_heads, seq_len, seq_len + past_key_values_length)."""
+        total_len = seq_len + past_key_values_length
+        context_position = torch.arange(
+            past_key_values_length, total_len, dtype=torch.long, device=device
+        )[:, None]
+        memory_position = torch.arange(total_len, dtype=torch.long, device=device)[None, :]
+        relative_position = memory_position - context_position  # (S, S)
+        rp_bucket = self._relative_position_bucket(relative_position)
+        # (S, S, H)
+        values = self.relative_attention_bias(rp_bucket)
+        # (1, H, S, S)
+        bias = values.permute(2, 0, 1).unsqueeze(0)
+        return cast(torch.Tensor, bias)
+
+
+class SelfAttentionWithRelPos(nn.Module):
+    """Multi-head self-attention with relative position bias and causal mask."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        rel_pos_bias: RelativePositionBias,
+    ):
+        super().__init__()
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.rel_pos_bias = rel_pos_bias
+
+        self.q_proj = nn.Linear(d_model, d_model, bias=False)
+        self.k_proj = nn.Linear(d_model, d_model, bias=False)
+        self.v_proj = nn.Linear(d_model, d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        padding_mask: torch.Tensor | None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """
+        Args:
+            x: (batch, seq_len, d_model)
+            causal_mask: (seq_len, seq_len + past_len) bool, True where masked
+            padding_mask: (batch, seq_len + past_len) bool, True for PAD tokens
+            past_key_value: Tuple of (key, value) tensors from previous step
+            use_cache: Whether to return new key/value states
+        """
+        bsz, seq_len, _ = x.size()
+        device = x.device
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # (batch, n_heads, seq_len, head_dim)
+        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        past_len = 0
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            past_len = past_k.size(2)
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        current_key_value = (k, v) if use_cache else None
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Relative position bias: (1, n_heads, seq_len, seq_len + past_len)
+        rel_bias = self.rel_pos_bias(seq_len, device, past_key_values_length=past_len)
+        attn_scores = attn_scores + rel_bias
+
+        # Causal mask
+        if causal_mask is not None:
+            attn_scores = attn_scores.masked_fill(
+                causal_mask.to(device=device)[None, None, :, :], float("-inf")
+            )
+
+        # Key padding mask
+        if padding_mask is not None:
+            attn_scores = attn_scores.masked_fill(padding_mask[:, None, None, :], float("-inf"))
+
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        attn_output = torch.matmul(attn_weights, v)  # (batch, n_heads, seq_len, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
+
+        return self.o_proj(attn_output), current_key_value
+
+
+class DecoderBlock(nn.Module):
+    """Single decoder block with self-attention and feed-forward network."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        rel_pos_bias: RelativePositionBias,
+    ):
+        super().__init__()
+        self.self_attn = SelfAttentionWithRelPos(d_model, n_heads, dropout, rel_pos_bias)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        d_ff = d_model * 4
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        padding_mask: torch.Tensor | None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        # Self-attention block
+        h, present_kv = self.self_attn(
+            self.norm1(x),
+            causal_mask,
+            padding_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        x = x + self.dropout(h)
+
+        # Feed-forward block
+        h = self.ff(self.norm2(x))
+        x = x + self.dropout(h)
+        return x, present_kv
 
 
 class OnlineTransformer(nn.Module):
@@ -60,35 +257,29 @@ class OnlineTransformer(nn.Module):
             padding_idx=data_config.pad_id,
         )
 
-        # Positional encoding length must accommodate the full interleaved
-        # sequence produced by OnlineDataset. With a frame horizon of
-        # `data_config.max_len` we have at most:
-        #
-        #   len(interleaved) = 1 + 2T  where T ≤ data_config.max_len
-        #
-        # so we allocate positional embeddings for up to `1 + 2 * max_len`
-        # positions.
-        max_seq_len = 1 + 2 * data_config.max_len
-        self.pos_enc = PositionalEncoding(model_config.d_model, max_seq_len)
-
-        # Causal encoder: stack of transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_config.d_model,
-            nhead=model_config.n_heads,
-            dim_feedforward=model_config.d_model * 4,
-            dropout=model_config.dropout,
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=model_config.n_layers,
+        # Relative position bias shared across all decoder layers. The maximum
+        # sequence length seen during training is 1 + 2 * max_len.
+        self.rel_pos_bias = RelativePositionBias(
+            num_buckets=32,
+            max_distance=128,
+            num_heads=model_config.n_heads,
         )
 
-        # Final layer norm (for norm_first architecture)
-        self.final_norm = nn.LayerNorm(model_config.d_model)
+        # Stack of decoder blocks
+        self.layers = nn.ModuleList(
+            [
+                DecoderBlock(
+                    d_model=model_config.d_model,
+                    n_heads=model_config.n_heads,
+                    dropout=model_config.dropout,
+                    rel_pos_bias=self.rel_pos_bias,
+                )
+                for _ in range(model_config.n_layers)
+            ]
+        )
 
-        # Output projection to unified vocabulary
+        # Final normalization and projection to vocabulary
+        self.final_norm = RMSNorm(model_config.d_model)
         self.fc_out = nn.Linear(model_config.d_model, self.vocab_size)
 
         self.pad_id = data_config.pad_id
@@ -116,52 +307,81 @@ class OnlineTransformer(nn.Module):
 
         self.register_buffer("logits_mask", logits_mask, persistent=False)
 
-    def _create_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+    def _create_causal_mask(
+        self, seq_len: int, device: torch.device, past_len: int = 0
+    ) -> torch.Tensor:
         """Create causal attention mask.
 
         Args:
             seq_len: Sequence length
             device: Device to create tensor on
+            past_len: Length of past key values
 
         Returns:
-            Boolean mask of shape (seq_len, seq_len), True where masked
+            Boolean mask of shape (seq_len, seq_len + past_len), True where masked
         """
-        return torch.triu(
-            torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+        full_len = seq_len + past_len
+        mask = torch.triu(
+            torch.ones(full_len, full_len, dtype=torch.bool, device=device),
             diagonal=1,
         )
+        return mask[past_len:, :]
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Forward pass for training.
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Forward pass for training or generation.
 
         Args:
             input_ids: Interleaved tokens (batch, seq_len) in unified ID space.
                        Format: [SOS, y₁, x₁, y₂, x₂, ...]
+            past_key_values: List of tuples of (key, value) tensors from previous step.
+            use_cache: Whether to return new key/value states.
 
         Returns:
             Logits over unified vocabulary (batch, seq_len, vocab_size)
+            If use_cache is True, also returns list of new (key, value) tuples.
         """
         device = input_ids.device
         seq_len = input_ids.size(1)
 
+        past_len = 0
+        if past_key_values is not None:
+            past_len = past_key_values[0][0].size(2)
+
         # Create causal mask
-        causal_mask = self._create_causal_mask(seq_len, device)
+        causal_mask = self._create_causal_mask(seq_len, device, past_len=past_len)
 
         # Create padding mask
         padding_mask = input_ids == self.pad_id
+        if past_len > 0:
+            # Assume past is not padded (valid context)
+            past_mask = torch.zeros((input_ids.size(0), past_len), dtype=torch.bool, device=device)
+            padding_mask = torch.cat([past_mask, padding_mask], dim=1)
 
-        # Embed and add positional encoding
-        x = self.pos_enc(self.embed(input_ids))
+        # Embed tokens; we rely on relative position bias rather than absolute
+        # positional encodings.
+        x = self.embed(input_ids)
 
-        # Causal encoder: self-attention with a lower-triangular (causal) mask
-        out = self.encoder(
-            x,
-            mask=causal_mask,
-            src_key_padding_mask=padding_mask,
-        )
+        next_decoder_cache = []
 
-        out = self.final_norm(out)
+        # Apply stacked decoder blocks with causal + padding masks
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            x, present_kv = layer(
+                x, causal_mask, padding_mask, past_key_value=past_kv, use_cache=use_cache
+            )
+            if use_cache:
+                next_decoder_cache.append(present_kv)
+
+        out = self.final_norm(x)
         logits: torch.Tensor = self.fc_out(out)
+
+        if use_cache:
+            return logits, next_decoder_cache
         return logits
 
     @torch.no_grad()
@@ -229,7 +449,7 @@ class OnlineTransformer(nn.Module):
 
         # Initialize with SOS chord token
         # Sequence format: [SOS, y₁, x₁, y₂, x₂, ...]
-        sequence = torch.full(
+        input_ids = torch.full(
             (batch_size, 1),
             sos_unified,
             dtype=torch.long,
@@ -237,13 +457,18 @@ class OnlineTransformer(nn.Module):
         )
 
         generated_chords: list[torch.Tensor] = []
+        past_key_values = None
 
         for t in range(melody_len):
             # Predict y_{t+1} given current context
             # Context is [SOS] for t=0, or [SOS, y₁, x₁, ..., y_t, x_t] for t>0
-            logits = self.forward(sequence)  # (batch, seq_len, vocab)
+            logits, past_key_values = self.forward(
+                input_ids, past_key_values=past_key_values, use_cache=True
+            )  # (batch, seq_len, vocab)
 
             # Get logits for next position (chord prediction)
+            # If input_ids has length 1 (initial), it predicts y1.
+            # If input_ids has length 2 ([y, x]), last logit predicts y_next.
             next_logits = logits[:, -1, :]  # (batch, vocab)
 
             # Optionally mask to chord tokens only.
@@ -262,16 +487,9 @@ class OnlineTransformer(nn.Module):
             # Get current melody token
             mel_unified = melody[:, t]
 
-            # Append in CORRECT order matching training: chord (y_t) THEN melody (x_t)
+            # Prepare input for next step: append [y_{t+1}, x_{t+1}]
             # This builds: [SOS, y₁, x₁, y₂, x₂, ...]
-            sequence = torch.cat(
-                [
-                    sequence,
-                    next_unified.unsqueeze(1),
-                    mel_unified.unsqueeze(1),
-                ],
-                dim=1,
-            )
+            input_ids = torch.stack([next_unified, mel_unified], dim=1)
 
         # Stack generated chords: (batch, num_chords) in unified ID space.
         return torch.stack(generated_chords, dim=1)

@@ -1,7 +1,6 @@
 """Tests for dataset modules."""
 
 import json
-import logging
 from pathlib import Path
 
 import numpy as np
@@ -66,8 +65,9 @@ def _create_test_dataset(
     n_samples: int = 5,
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Helper to create minimal dataset files for testing."""
-    # Create melody vocab with special tokens + some pitch tokens
-    melody_token_to_id = {
+    # Create melody vocab with special tokens + some pitch tokens (in-memory only;
+    # the runtime pipeline uses a unified vocab file on disk).
+    melody_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
@@ -78,8 +78,8 @@ def _create_test_dataset(
         melody_token_to_id[f"pitch_{midi}_on"] = len(melody_token_to_id)
         melody_token_to_id[f"pitch_{midi}_hold"] = len(melody_token_to_id)
 
-    # Create chord vocab with special tokens + some chord tokens.
-    chord_token_to_id = {
+    # Create chord vocab with special tokens + some chord tokens (in-memory only).
+    chord_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
@@ -92,9 +92,6 @@ def _create_test_dataset(
             base = f"{root}:{quality}/0"
             chord_token_to_id[f"{base}_on"] = len(chord_token_to_id)
             chord_token_to_id[f"{base}_hold"] = len(chord_token_to_id)
-
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
     # Unified vocabulary matching the real preprocessing pipeline.
     unified_token_to_id = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
@@ -164,7 +161,7 @@ def test_dataset_valid_split_no_augmentation(tmp_path: Path) -> None:
 
 def test_transpose_melody(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=4, max_len=4, max_transpose=12)
-    melody_token_to_id = {
+    melody_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
@@ -172,9 +169,7 @@ def test_transpose_melody(tmp_path: Path) -> None:
         "pitch_60_on": 4,
         "pitch_62_on": 5,
     }
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    chord_token_to_id = {cfg.pad_token: cfg.pad_id}
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    chord_token_to_id: dict[str, int] = {cfg.pad_token: cfg.pad_id}
     unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     src = np.array(
@@ -194,14 +189,13 @@ def test_transpose_melody(tmp_path: Path) -> None:
 
 def test_transpose_chord(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=4, max_len=4, max_transpose=12)
-    melody_token_to_id = {
+    melody_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
         cfg.rest_token: cfg.rest_id,
     }
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    chord_token_to_id = {
+    chord_token_to_id: dict[str, int] = {
         cfg.pad_token: cfg.pad_id,
         cfg.sos_token: cfg.sos_id,
         cfg.eos_token: cfg.eos_id,
@@ -211,8 +205,6 @@ def test_transpose_chord(tmp_path: Path) -> None:
         "C:4-3/0_hold": 6,
         "D:4-3/0_hold": 7,
     }
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
-
     unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     src = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
@@ -257,52 +249,13 @@ def test_dataset_file_not_found(tmp_path: Path) -> None:
 
 def test_dataset_length_mismatch(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=16, max_len=16)
-    melody_token_to_id = {cfg.pad_token: cfg.pad_id}
-    chord_token_to_id = {cfg.pad_token: cfg.pad_id}
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
+    melody_token_to_id: dict[str, int] = {cfg.pad_token: cfg.pad_id}
+    chord_token_to_id: dict[str, int] = {cfg.pad_token: cfg.pad_id}
     _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
     np.save(cfg.data_processed / "train_src.npy", np.zeros((5, 16), dtype=np.int32))
     np.save(cfg.data_processed / "train_tgt.npy", np.zeros((3, 16), dtype=np.int32))
     with pytest.raises(ValueError, match="Mismatch"):
         OfflineDataset(cfg, split="train")
-
-
-def test_transpose_missing_token_logs_warning(tmp_path: Path, caplog) -> None:
-    """_transpose_melody should log a warning when a token is not in vocab."""
-    cfg = DataConfig(data_processed=tmp_path, storage_len=4, max_len=4, max_transpose=12)
-
-    # Create vocab with pitch 60 but NOT pitch 62
-    melody_token_to_id = {
-        cfg.pad_token: cfg.pad_id,
-        cfg.sos_token: cfg.sos_id,
-        cfg.eos_token: cfg.eos_id,
-        cfg.rest_token: cfg.rest_id,
-        "pitch_60_on": 4,
-    }
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    chord_token_to_id = {cfg.pad_token: cfg.pad_id}
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
-    _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
-
-    src = np.array(
-        [[cfg.sos_id, melody_token_to_id["pitch_60_on"], cfg.eos_id, cfg.pad_id]], dtype=np.int32
-    )
-    tgt = np.array([[cfg.sos_id, cfg.rest_id, cfg.eos_id, cfg.pad_id]], dtype=np.int32)
-    np.save(cfg.data_processed / "train_src.npy", src)
-    np.save(cfg.data_processed / "train_tgt.npy", tgt)
-
-    ds = OfflineDataset(cfg, split="train")
-
-    # Transpose +2 semitones (pitch_60_on -> pitch_62_on).
-    # pitch_62_on is NOT in vocab, so it should log a warning and keep original.
-
-    with caplog.at_level(logging.WARNING):
-        transposed = ds._transpose_melody(src[0], semitones=2)
-
-    assert "Token pitch_62_on not found in vocab" in caplog.text
-    # The token should remain unchanged because we `continue`d the loop
-    assert transposed[1] == melody_token_to_id["pitch_60_on"]
 
 
 def test_online_dataset_len(tmp_path: Path) -> None:
@@ -409,8 +362,6 @@ def test_online_dataset_filters_zero_frame_sequences(tmp_path: Path) -> None:
         cfg.rest_token: cfg.rest_id,
         "C:4-3/0_on": 4,
     }
-    _write_vocab(cfg.vocab_melody, melody_token_to_id)
-    _write_vocab(cfg.vocab_chord, chord_token_to_id)
     unified_ids = _write_unified_vocab(cfg, melody_token_to_id, chord_token_to_id)
 
     # Build two sequences:

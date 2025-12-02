@@ -48,13 +48,13 @@ def test_parse_melody_token_valid_and_invalid() -> None:
 
 def test_chord_pitch_classes_numeric_quality() -> None:
     """chord_pitch_classes should interpret numeric interval strings correctly."""
-    # Simple triad quality "0-4-7": root + {0,4,7}
-    pcs_c = chord_pitch_classes("C", "0-4-7")
+    # Simple triad quality "4-3": successive intervals {4,3} → pcs {0,4,7}
+    pcs_c = chord_pitch_classes("C", "4-3")
     assert pcs_c == {0, 4, 7}
 
     # Root shift should move all pitch classes by the root index.
     d_index = PITCH_CLASSES.index("D")
-    pcs_d = chord_pitch_classes("D", "0-4-7")
+    pcs_d = chord_pitch_classes("D", "4-3")
     assert pcs_d == {(d_index + i) % 12 for i in {0, 4, 7}}
 
 
@@ -71,8 +71,8 @@ def test_note_in_chord_ratio_basic() -> None:
     """note_in_chord_ratio should count matches only when pitch class is in chord."""
     # Melody: E (pc 4), F (pc 5), Eb (pc 3)
     melody_tokens = ["pitch_64_on", "pitch_65_on", "pitch_63_on"]
-    # Chord: C with quality "0-4-7" (pcs {0,4,7}) at every frame
-    chord_tokens = ["C:0-4-7/0_on"] * 3
+    # Chord: C with quality "4-3" (pcs {0,4,7}) at every frame
+    chord_tokens = ["C:4-3/0_on"] * 3
 
     ratio = note_in_chord_ratio(melody_tokens, chord_tokens)
     # E (4) and Eb (3) -> only E is in {0,4,7}, so 1 match out of 3

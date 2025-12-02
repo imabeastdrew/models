@@ -3,6 +3,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
+from typing import cast
 
 import numpy as np
 import torch
@@ -18,6 +19,8 @@ class BaseDataset(Dataset, ABC):
 
     # Root names must match those used in preprocessing.ChordMapper.
     ROOT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+    # Precompute mapping for faster lookup during transposition-table construction.
+    ROOT_NAME_TO_INDEX = {name: idx for idx, name in enumerate(ROOT_NAMES)}
 
     def __init__(self, config: DataConfig, split: str = "train"):
         self.config = config
@@ -78,6 +81,72 @@ class BaseDataset(Dataset, ABC):
         self.id_to_melody = {v: k for k, v in self.vocab_melody.items()}
         self.id_to_chord = {v: k for k, v in self.vocab_chord.items()}
 
+        self._build_transposition_tables()
+
+    def _build_transposition_tables(self) -> None:
+        """Pre-compute transposition tables for melody and chords."""
+        max_transpose = self.config.max_transpose
+        vocab_size = self.unified_vocab_size
+        num_offsets = 2 * max_transpose + 1
+
+        # Initialize with identity (default to original token ID)
+        self.melody_transpose_table = np.arange(vocab_size, dtype=np.int32)
+        self.melody_transpose_table = np.tile(self.melody_transpose_table, (num_offsets, 1))
+
+        self.chord_transpose_table = np.arange(vocab_size, dtype=np.int32)
+        self.chord_transpose_table = np.tile(self.chord_transpose_table, (num_offsets, 1))
+
+        # Fill tables
+        for semitones in range(-max_transpose, max_transpose + 1):
+            row_idx = semitones + max_transpose
+
+            # --- Melody ---
+            for token, token_id in self.vocab_melody.items():
+                if not token.startswith("pitch_"):
+                    continue
+                try:
+                    _, pitch_str, kind = token.split("_", 2)
+                    pitch_val = int(pitch_str)
+
+                    new_pitch = max(0, min(127, pitch_val + semitones))
+                    new_token = f"pitch_{new_pitch}_{kind}"
+                    new_id = self.vocab_melody.get(new_token)
+
+                    if new_id is not None:
+                        self.melody_transpose_table[row_idx, token_id] = new_id
+                except ValueError:
+                    continue
+
+            # --- Chord ---
+            for token, token_id in self.vocab_chord.items():
+                suffix = None
+                if token.endswith("_on"):
+                    base = token[:-3]
+                    suffix = "_on"
+                elif token.endswith("_hold"):
+                    base = token[:-5]
+                    suffix = "_hold"
+                else:
+                    continue
+
+                try:
+                    root, rest = base.split(":", 1)
+                except ValueError:
+                    # Malformed chord token; skip.
+                    continue
+
+                root_idx = self.ROOT_NAME_TO_INDEX.get(root)
+                if root_idx is None:
+                    # Unknown root name; skip.
+                    continue
+
+                new_root = self.ROOT_NAMES[(root_idx + semitones) % 12]
+                new_token = f"{new_root}:{rest}{suffix}"
+                new_id = self.vocab_chord.get(new_token)
+
+                if new_id is not None:
+                    self.chord_transpose_table[row_idx, token_id] = new_id
+
     def _transpose_melody(self, seq: np.ndarray, semitones: int) -> np.ndarray:
         """Transpose a melody token sequence by a given number of semitones.
 
@@ -86,43 +155,14 @@ class BaseDataset(Dataset, ABC):
         if semitones == 0:
             return seq
 
-        result = seq.copy()
+        row_idx = semitones + self.config.max_transpose
+        if row_idx < 0 or row_idx >= self.melody_transpose_table.shape[0]:
+            logger.warning(f"Semitones {semitones} out of bounds for pre-computed table.")
+            return seq
 
-        for i, token_id in enumerate(seq):
-            # Leave special tokens untouched.
-            if token_id in (
-                self.config.pad_id,
-                self.config.sos_id,
-                self.config.eos_id,
-                self.config.rest_id,
-            ):
-                continue
-
-            token = self.id_to_melody.get(int(token_id))
-            if token is None:
-                continue
-
-            # Melody tokens: "pitch_{midi}_on" / "pitch_{midi}_hold"
-            if not token.startswith("pitch_"):
-                continue
-            try:
-                _, pitch_str, kind = token.split("_", 2)
-                pitch_val = int(pitch_str)
-            except ValueError:
-                continue
-
-            new_pitch = max(0, min(127, pitch_val + semitones))
-            new_token = f"pitch_{new_pitch}_{kind}"
-            new_id = self.vocab_melody.get(new_token)
-            if new_id is None:
-                logger.warning(
-                    f"Token {new_token} not found in vocab after transposition "
-                    f"(original: {token}, semitones: {semitones})"
-                )
-                continue
-            result[i] = new_id
-
-        return result
+        # NumPy advanced indexing is typed as returning Any in older stubs; cast
+        # to satisfy static type checkers while preserving the ndarray return.
+        return cast(np.ndarray, self.melody_transpose_table[row_idx, seq])
 
     def _transpose_chord(self, seq: np.ndarray, semitones: int) -> np.ndarray:
         """Transpose a chord token sequence by a given number of semitones.
@@ -132,55 +172,13 @@ class BaseDataset(Dataset, ABC):
         if semitones == 0:
             return seq
 
-        result = seq.copy()
+        row_idx = semitones + self.config.max_transpose
+        if row_idx < 0 or row_idx >= self.chord_transpose_table.shape[0]:
+            logger.warning(f"Semitones {semitones} out of bounds for pre-computed table.")
+            return seq
 
-        for i, token_id in enumerate(seq):
-            # Leave special tokens untouched.
-            if token_id in (
-                self.config.pad_id,
-                self.config.sos_id,
-                self.config.eos_id,
-                self.config.rest_id,
-            ):
-                continue
-
-            token = self.id_to_chord.get(int(token_id))
-            if token is None:
-                continue
-
-            # Chord tokens: "{Root}:{quality}/{inv}_on" or "_hold"
-            suffix = None
-            if token.endswith("_on"):
-                base = token[:-3]
-                suffix = "_on"
-            elif token.endswith("_hold"):
-                base = token[:-5]
-                suffix = "_hold"
-            else:
-                continue
-
-            try:
-                root, rest = base.split(":", 1)
-            except ValueError:
-                continue
-
-            try:
-                root_idx = self.ROOT_NAMES.index(root)
-            except ValueError:
-                continue
-
-            new_root = self.ROOT_NAMES[(root_idx + semitones) % 12]
-            new_token = f"{new_root}:{rest}{suffix}"
-            new_id = self.vocab_chord.get(new_token)
-            if new_id is None:
-                logger.warning(
-                    f"Token {new_token} not found in vocab after transposition "
-                    f"(original: {token}, semitones: {semitones})"
-                )
-                continue
-            result[i] = new_id
-
-        return result
+        # See note in _transpose_melody about NumPy typings.
+        return cast(np.ndarray, self.chord_transpose_table[row_idx, seq])
 
     @abstractmethod
     def __len__(self) -> int:

@@ -116,9 +116,6 @@ def process_dataset(config: DataConfig) -> None:
                         chord_vocab.add(f"{token}_on")
                         chord_vocab.add(f"{token}_hold")
 
-    melody_vocab.save(config.vocab_melody)
-    chord_vocab.save(config.vocab_chord)
-
     # ------------------------------------------------------------------
     # Unified vocabulary
     # ------------------------------------------------------------------

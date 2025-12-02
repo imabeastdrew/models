@@ -23,17 +23,18 @@ from musicagent.utils import seed_everything, setup_logging
 logger = logging.getLogger(__name__)
 
 
-def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
-    """Create a linear learning rate schedule with warmup."""
+def get_constant_schedule_with_warmup(optimizer, num_warmup_steps: int):
+    """Linear warmup followed by a constant learning rate.
 
-    def lr_lambda(current_step):
+    This mirrors the schedule described in the ReaLchords paper: a fixed base
+    learning rate (1e-3 in our configs) with a short warmup phase and no
+    decay over the remaining training steps.
+    """
+
+    def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
-        return max(
-            0.0,
-            float(num_training_steps - current_step)
-            / float(max(1, num_training_steps - num_warmup_steps)),
-        )
+        return 1.0
 
     return LambdaLR(optimizer, lr_lambda)
 
@@ -43,24 +44,26 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def train_epoch(
+def train_steps(
     model,
     loader,
     optimizer,
     scheduler,
     criterion,
     device,
-    epoch,
     global_step,
     use_wandb: bool = True,
     log_interval: int = 100,
+    max_steps: int | None = None,
 ):
-    """Train for one epoch."""
+    """Train for a series of steps over the given loader."""
     model.train()
     total_loss = 0.0
     start_time = time.time()
 
     for i, batch in enumerate(loader):
+        if max_steps is not None and global_step >= max_steps:
+            break
         # DataLoader + collate_fn returns a tuple (src_batch, tgt_batch).
         if isinstance(batch, tuple):
             src, tgt = batch
@@ -94,7 +97,7 @@ def train_epoch(
             ms_per_batch = elapsed * 1000 / log_interval
 
             logger.info(
-                f"| epoch {epoch} | {i}/{len(loader)} batches | "
+                f"| step {global_step} | batch {i}/{len(loader)} | "
                 f"ms/batch {ms_per_batch:.2f} | "
                 f"lr {lr:.6f} | loss {cur_loss:.4f}"
             )
@@ -105,7 +108,6 @@ def train_epoch(
                         "train/loss": cur_loss,
                         "train/lr": lr,
                         "train/ms_per_batch": ms_per_batch,
-                        "train/epoch": epoch,
                     },
                     step=global_step,
                 )
@@ -270,8 +272,15 @@ def train_offline(args: argparse.Namespace) -> None:
     )
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
 
-    total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(optimizer, m_cfg.warmup_steps, total_steps)
+    # Training schedule is purely step-based: --max-steps must be provided
+    # and determines when training stops.
+    if args.max_steps is None:
+        raise ValueError(
+            "train_offline uses step-based training; pass "
+            "`--max-steps` to specify the total number of optimizer steps."
+        )
+    max_steps = args.max_steps
+    scheduler = get_constant_schedule_with_warmup(optimizer, m_cfg.warmup_steps)
 
     # Initialize wandb
     use_wandb = not args.no_wandb
@@ -289,7 +298,6 @@ def train_offline(args: argparse.Namespace) -> None:
                 "max_len": d_cfg.max_len,
                 "frame_rate": d_cfg.frame_rate,
                 "storage_len": d_cfg.storage_len,
-                "epochs": args.epochs,
                 "weight_decay": 0.0,
                 "grad_clip": 0.5,
                 "vocab_src_size": vocab_src_len,
@@ -297,7 +305,7 @@ def train_offline(args: argparse.Namespace) -> None:
                 "total_params": total_params,
                 "train_samples": len(train_ds),
                 "valid_samples": len(valid_ds),
-                "total_steps": total_steps,
+                "total_steps": max_steps,
             },
             tags=["transformer", "offline", "melody-chord", "realchords"],
         )
@@ -309,17 +317,20 @@ def train_offline(args: argparse.Namespace) -> None:
     best_val_loss = float("inf")
     global_step = 0
 
-    for epoch in range(1, args.epochs + 1):
-        global_step = train_epoch(
+    # Train until we hit the requested number of steps. Validation and
+    # checkpointing are performed after each full pass through the loader (or
+    # earlier if we exhaust the step budget mid-pass).
+    while global_step < max_steps:
+        global_step = train_steps(
             model,
             train_loader,
             optimizer,
             scheduler,
             criterion,
             device,
-            epoch,
             global_step,
             use_wandb,
+            max_steps=max_steps,
         )
         val_loss = evaluate(model, valid_loader, criterion, device)
         try:
@@ -329,7 +340,8 @@ def train_offline(args: argparse.Namespace) -> None:
 
         logger.info("-" * 89)
         logger.info(
-            f"| End of epoch {epoch} | valid loss {val_loss:.4f} | perplexity {val_ppl:.2f}"
+            f"| Validation | step {global_step} | "
+            f"valid loss {val_loss:.4f} | perplexity {val_ppl:.2f}"
         )
         logger.info("-" * 89)
 
@@ -338,7 +350,7 @@ def train_offline(args: argparse.Namespace) -> None:
                 {
                     "valid/loss": val_loss,
                     "valid/perplexity": val_ppl,
-                    "valid/epoch": epoch,
+                    "valid/step": global_step,
                 },
                 step=global_step,
             )
@@ -364,14 +376,14 @@ def train_offline(args: argparse.Namespace) -> None:
                     wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
                 except OverflowError:
                     wandb.run.summary["best_val_perplexity"] = float("inf")
-                wandb.run.summary["best_epoch"] = epoch
+                wandb.run.summary["best_step"] = global_step
 
                 artifact = wandb.Artifact(
                     name="best-model",
                     type="model",
                     metadata={
                         "model_type": "offline",
-                        "epoch": epoch,
+                        "step": global_step,
                         "val_loss": val_loss,
                         "val_perplexity": val_ppl,
                     },
@@ -379,7 +391,11 @@ def train_offline(args: argparse.Namespace) -> None:
                 artifact.add_file(str(checkpoint_path))
                 artifact.add_file(str(data_cfg_path))
                 artifact.add_file(str(model_cfg_path))
-                wandb.log_artifact(artifact, aliases=["best", f"epoch-{epoch}"])
+                wandb.log_artifact(artifact, aliases=["best", f"step-{global_step}"])
+
+        if max_steps is not None and global_step >= max_steps:
+            logger.info("Reached max_steps=%d; stopping training.", max_steps)
+            break
 
     if use_wandb:
         wandb.finish()

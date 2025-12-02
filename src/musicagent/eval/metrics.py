@@ -50,17 +50,9 @@ def chord_pitch_classes(root: str, quality: str) -> set[int]:
 
     ``quality`` is a numeric interval string produced by
     :class:`scripts.preprocess.ChordMapper`, based on Hooktheory's
-    ``root_position_intervals``.
-
-    In our processed data this is typically a list of **successive intervals**
-    between chord tones (e.g. ``"4-3"`` for a major triad), but our tests also
-    exercise **absolute encodings** like ``"0-4-7"``. We therefore support
-    both encodings:
-
-    - Successive encoding (no explicit 0): e.g. ``"4-3"`` →
-      cumulative sums → offsets {0, 4, 7}.
-    - Absolute encoding (contains 0): e.g. ``"0-4-7"`` →
-      interpreted directly as offsets from the root.
+    ``root_position_intervals``. In the source data, this is a list of
+    *successive* intervals between chord tones (e.g. ``"4-3"`` for a
+    major triad), not absolute offsets from the root.
     """
     try:
         root_pc = PITCH_CLASSES.index(root)
@@ -77,18 +69,13 @@ def chord_pitch_classes(root: str, quality: str) -> set[int]:
     if not raw_intervals:
         return set()
 
-    # If an explicit 0 appears, interpret as absolute offsets (e.g. "0-4-7").
-    if any(i == 0 for i in raw_intervals):
-        rel_intervals = {i % 12 for i in raw_intervals}
-        rel_intervals.add(0)  # ensure root is included even if not listed
-    else:
-        # Successive-interval encoding (e.g. "4-3" for a major triad):
-        # take cumulative sums starting from 0.
-        rel_intervals = {0}
-        acc = 0
-        for step in raw_intervals:
-            acc = (acc + step) % 12
-            rel_intervals.add(acc)
+    # Successive-interval encoding: take cumulative sums starting from 0.
+    # For example, "4-3" → relative offsets {0, 4, 7}.
+    rel_intervals: set[int] = {0}
+    acc = 0
+    for step in raw_intervals:
+        acc = (acc + step) % 12
+        rel_intervals.add(acc)
 
     return {(root_pc + interval) % 12 for interval in rel_intervals}
 
