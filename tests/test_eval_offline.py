@@ -61,6 +61,8 @@ def _create_offline_test_data(
             unified_token_to_id[token] = melody_size + cid
 
     _write_vocab(cfg.vocab_unified, unified_token_to_id)
+    _write_vocab(cfg.vocab_melody, melody_token_to_id)
+    _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
     # Create test split only, matching the unified on-disk layout from preprocessing.
     src = np.full((n_samples, cfg.storage_len), cfg.rest_id, dtype=np.int32)
@@ -90,6 +92,35 @@ def _create_offline_test_data(
     return melody_token_to_id, chord_token_to_id
 
 
+def _is_valid_chord_token(token: str) -> bool:
+    """Check if a token looks like a chord token (not a melody token)."""
+    # Special tokens are valid in any position
+    if token in ("<pad>", "<sos>", "<eos>", "rest"):
+        return True
+    # Chord tokens have format "Root:quality/inversion_on" or "_hold"
+    # e.g., "C:4-3/0_on", "Db:4-3-7/1_hold"
+    if ":" in token and "/" in token:
+        return True
+    # If it starts with "pitch_", it's a melody token - NOT valid as chord
+    if token.startswith("pitch_"):
+        return False
+    return False
+
+
+def _is_valid_melody_token(token: str) -> bool:
+    """Check if a token looks like a melody token (not a chord token)."""
+    # Special tokens are valid in any position
+    if token in ("<pad>", "<sos>", "<eos>", "rest"):
+        return True
+    # Melody tokens have format "pitch_{midi}_{on|hold}"
+    if token.startswith("pitch_"):
+        return True
+    # If it has chord format, it's NOT valid as melody
+    if ":" in token and "/" in token:
+        return False
+    return False
+
+
 def test_offline_main_smoke(tmp_path) -> None:
     """End-to-end test for musicagent.eval.offline.main() on a tiny dummy dataset.
 
@@ -115,12 +146,12 @@ def test_offline_main_smoke(tmp_path) -> None:
     melody_vocab, chord_vocab = _create_offline_test_data(data_dir, d_cfg, n_samples=3)
 
     # Build and save a tiny model checkpoint matching the configs above.
-    # The evaluation code operates in unified ID space, so we instantiate the
-    # model with the unified vocab size derived from the unified vocab file.
-    with (data_dir / "vocab_unified.json").open() as f:
-        unified = json.load(f)["token_to_id"]
-    vocab_size = max(unified.values(), default=0) + 1
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
+    # The model uses separate vocab sizes for melody and chord embeddings.
+    melody_vocab_size = max(melody_vocab.values(), default=0) + 1
+    chord_vocab_size = max(chord_vocab.values(), default=0) + 1
+    model = OfflineTransformer(
+        m_cfg, d_cfg, melody_vocab_size=melody_vocab_size, chord_vocab_size=chord_vocab_size
+    )
     checkpoint_path = tmp_path / "offline_test_model.pt"
     torch.save(model.state_dict(), checkpoint_path)
 
@@ -146,3 +177,75 @@ def test_offline_main_smoke(tmp_path) -> None:
         # The test passes if main() runs without raising and
         # completes a full evaluation pass over the dummy test set.
         eval_offline.main()
+
+
+def test_offline_eval_decodes_tokens_correctly(tmp_path) -> None:
+    """Verify that evaluate_offline decodes tokens with correct vocabulary mappings.
+
+    This test catches bugs where chord IDs are decoded using the wrong vocabulary
+    (e.g., unified vocab instead of chord vocab), which would produce melody tokens
+    instead of chord tokens.
+    """
+    from torch.utils.data import DataLoader
+
+    from musicagent.data import OfflineDataset, make_offline_collate_fn
+
+    data_dir = tmp_path / "realchords_data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    d_cfg = DataConfig(data_processed=data_dir, max_len=16, storage_len=32)
+    m_cfg = OfflineConfig(
+        d_model=32,
+        n_heads=4,
+        n_layers=2,
+        dropout=0.0,
+    )
+
+    melody_vocab, chord_vocab = _create_offline_test_data(data_dir, d_cfg, n_samples=3)
+
+    melody_vocab_size = max(melody_vocab.values(), default=0) + 1
+    chord_vocab_size = max(chord_vocab.values(), default=0) + 1
+
+    model = OfflineTransformer(
+        m_cfg, d_cfg, melody_vocab_size=melody_vocab_size, chord_vocab_size=chord_vocab_size
+    )
+    model.eval()
+
+    test_ds = OfflineDataset(d_cfg, split="test")
+    collate = make_offline_collate_fn(pad_id=d_cfg.pad_id)
+    test_loader = DataLoader(test_ds, batch_size=2, shuffle=False, collate_fn=collate)
+
+    result = eval_offline.evaluate_offline(
+        model=model,
+        test_loader=test_loader,
+        d_cfg=d_cfg,
+        device=torch.device("cpu"),
+        log_progress=False,
+    )
+
+    # Verify we got predictions
+    assert result.num_sequences > 0, "Expected at least one sequence"
+    assert len(result.cached_predictions) > 0, "Expected cached predictions"
+
+    # Semantic validation: chord tokens should look like chords, not melody tokens
+    for idx, (mel_tokens, pred_tokens, ref_tokens) in result.cached_predictions.items():
+        # Melody tokens should be valid melody tokens
+        for token in mel_tokens:
+            assert _is_valid_melody_token(token), (
+                f"Melody token decoded incorrectly as chord-like token: {token!r} "
+                f"(sequence {idx})"
+            )
+
+        # Predicted chord tokens should be valid chord tokens
+        for token in pred_tokens:
+            assert _is_valid_chord_token(token), (
+                f"Predicted chord decoded as melody token: {token!r} "
+                f"(sequence {idx}). This indicates a vocab mapping bug."
+            )
+
+        # Reference chord tokens should be valid chord tokens
+        for token in ref_tokens:
+            assert _is_valid_chord_token(token), (
+                f"Reference chord decoded as melody token: {token!r} "
+                f"(sequence {idx}). This indicates a vocab mapping bug."
+            )

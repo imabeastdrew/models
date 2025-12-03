@@ -96,21 +96,27 @@ def evaluate_offline(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # In the unified pipeline, sequences on disk already use the unified ID
-    # space produced by preprocessing. If explicit mappings are not provided, we
-    # always decode via this unified vocabulary.
+    # With separate vocabularies, melody IDs remain in unified/melody space
+    # (same IDs), but chord IDs are now in chord vocab space. We must use
+    # the appropriate mapping for each.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
                 "id_to_melody/id_to_chord not provided and test_loader has no dataset."
             )
 
-        if hasattr(dataset, "unified_id_to_token"):
+        if hasattr(dataset, "melody_id_to_token") and hasattr(dataset, "chord_id_to_token"):
+            id_to_melody = dataset.melody_id_to_token  # type: ignore[assignment]
+            id_to_chord = dataset.chord_id_to_token  # type: ignore[assignment]
+        elif hasattr(dataset, "unified_id_to_token"):
+            # Fallback for legacy datasets without separate vocab files
             unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
             id_to_melody = unified_map
             id_to_chord = unified_map
         else:
-            raise ValueError("Dataset does not expose unified_id_to_token for decoding.")
+            raise ValueError(
+                "Dataset does not expose melody_id_to_token/chord_id_to_token for decoding."
+            )
 
     # --- 1. Test loss / perplexity (teacher-forced) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
@@ -233,14 +239,14 @@ def main():
         collate_fn=collate,
     )
 
-    # Load model (unified ID space)
-    vocab_size = test_ds.unified_vocab_size
-    chord_token_ids = sorted(test_ds.vocab_chord.values())
+    # Load model with separate vocab sizes
+    melody_vocab_size = test_ds.melody_vocab_size
+    chord_vocab_size = test_ds.chord_vocab_size
     model = OfflineTransformer(
         m_cfg,
         d_cfg,
-        vocab_size=vocab_size,
-        chord_token_ids=chord_token_ids,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
     ).to(device)
     state_dict = safe_load_state_dict(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)

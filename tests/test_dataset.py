@@ -34,6 +34,9 @@ def _write_unified_vocab(
     - Keeps melody IDs as-is.
     - Offsets non-special chord IDs above the melody range so that a single
       embedding table can cover both tracks.
+
+    Also writes separate melody and chord vocabulary files for models that
+    use separate embedding tables.
     """
     unified_token_to_id: dict[str, int] = {}
 
@@ -56,6 +59,11 @@ def _write_unified_vocab(
             unified_token_to_id[token] = melody_size + cid
 
     _write_vocab(cfg.vocab_unified, unified_token_to_id)
+
+    # Also write separate vocab files for models with separate embeddings
+    _write_vocab(cfg.vocab_melody, melody_token_to_id)
+    _write_vocab(cfg.vocab_chord, chord_token_to_id)
+
     return unified_token_to_id
 
 
@@ -300,47 +308,60 @@ def test_online_dataset_interleave_format(tmp_path: Path) -> None:
     sample = ds[0]
 
     input_ids = sample["input_ids"]
+    is_melody = sample["is_melody"]
     melody_vocab_size = ds.melody_vocab_size
+    chord_vocab_size = ds.chord_vocab_size
 
     # Position 0 is SOS (chord), odd positions are chords, even positions (>=2)
-    # are melody tokens.
+    # are melody tokens. Now input_ids contains native vocab IDs:
+    # - Chord positions: chord vocab IDs (0-chord_vocab_size)
+    # - Melody positions: melody vocab IDs (0-melody_vocab_size)
+    # The is_melody mask indicates which vocab each position uses.
 
-    # Check position 0 is a chord token in unified vocab
+    # Check position 0 is a chord position (SOS)
+    assert not is_melody[0].item(), "Position 0 should be chord (SOS)"
     sos_token = input_ids[0].item()
-    assert sos_token >= melody_vocab_size or sos_token < 4, (
-        f"Position 0 should be SOS chord token, got {sos_token}"
-    )
+    assert sos_token < chord_vocab_size, f"SOS should be valid chord vocab ID, got {sos_token}"
 
-    # Odd positions should be chord tokens (offset by melody_vocab_size
-    # or special tokens)
+    # Odd positions should be chord tokens (in chord vocab space)
     for i in range(1, len(input_ids), 2):
+        assert not is_melody[i].item(), f"Odd position {i} should be chord"
         chord_token = input_ids[i].item()
-        assert chord_token >= melody_vocab_size or chord_token < 4, (
-            f"Odd position {i} should be chord token, got {chord_token}"
+        assert chord_token < chord_vocab_size, (
+            f"Odd position {i} should be valid chord vocab ID, got {chord_token}"
         )
 
-    # Even positions >= 2 should be melody tokens (no offset)
+    # Even positions >= 2 should be melody tokens (in melody vocab space)
     for i in range(2, len(input_ids), 2):
+        assert is_melody[i].item(), f"Even position {i} should be melody"
         melody_token = input_ids[i].item()
         assert melody_token < melody_vocab_size, (
-            f"Even position {i} should be melody token, got {melody_token}"
+            f"Even position {i} should be valid melody vocab ID, got {melody_token}"
         )
 
 
 def test_online_collate_fn_stacks_batches(tmp_path: Path) -> None:
-    """make_online_collate_fn should stack input_ids into a batch tensor."""
+    """make_online_collate_fn should stack input_ids and is_melody into batch tensors."""
     cfg = DataConfig(data_processed=tmp_path, storage_len=32, max_len=16)
     _create_test_dataset(tmp_path, cfg, n_samples=4)
     ds = OnlineDataset(cfg, split="valid")
     batch = [ds[i] for i in range(2)]
     collate = make_online_collate_fn(pad_id=cfg.pad_id)
-    input_ids = collate(batch)
+    result = collate(batch)
+
+    # Collate now returns a dict with input_ids and is_melody
+    assert "input_ids" in result
+    assert "is_melody" in result
+
+    input_ids = result["input_ids"]
+    is_melody = result["is_melody"]
 
     # Batch dimension should be the number of samples; sequence length should
     # match the interleaved length from the dataset and not exceed the
     # theoretical maximum 1 + 2 * max_len for frames.
     assert input_ids.shape[0] == 2
     assert 0 < input_ids.shape[1] <= 1 + 2 * cfg.max_len
+    assert is_melody.shape == input_ids.shape
 
 
 def test_online_dataset_filters_zero_frame_sequences(tmp_path: Path) -> None:
@@ -525,14 +546,16 @@ def test_offline_dataset_frame_alignment_after_crop(tmp_path: Path) -> None:
             tgt_token = tgt_seq[pos]
 
             # Find which frame index this corresponds to by parsing the pitch
+            # src_seq is in melody vocab space (same IDs as unified for melody)
             src_token_str = None
-            for tok, tok_id in unified_ids.items():
+            for tok, tok_id in melody_token_to_id.items():
                 if tok_id == src_token:
                     src_token_str = tok
                     break
 
+            # tgt_seq is now in chord vocab space, not unified
             tgt_token_str = None
-            for tok, tok_id in unified_ids.items():
+            for tok, tok_id in chord_token_to_id.items():
                 if tok_id == tgt_token:
                     tgt_token_str = tok
                     break

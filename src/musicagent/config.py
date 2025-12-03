@@ -38,6 +38,16 @@ class DataConfig:
         """Path to unified (melody + chord) vocabulary."""
         return self.data_processed / "vocab_unified.json"
 
+    @property
+    def vocab_melody(self) -> Path:
+        """Path to melody-only vocabulary."""
+        return self.data_processed / "vocab_melody.json"
+
+    @property
+    def vocab_chord(self) -> Path:
+        """Path to chord-only vocabulary."""
+        return self.data_processed / "vocab_chord.json"
+
 
 @dataclass
 class OfflineConfig:

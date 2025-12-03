@@ -5,7 +5,10 @@ It is trained on interleaved sequences of the form:
 
     [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
 
-where y_t are chord tokens (in unified chord space) and x_t are melody tokens.
+where y_t are chord tokens (in chord vocab space) and x_t are melody tokens
+(in melody vocab space). The model uses separate embedding tables for each
+modality, selected via the is_melody mask.
+
 The model is trained as a causal language model over this sequence and, at
 inference time, we only use the chord predictions while feeding in the given
 melody tokens.
@@ -218,41 +221,48 @@ class DecoderBlock(nn.Module):
 
 
 class OnlineTransformer(nn.Module):
-    """Causal transformer over interleaved melody/chord tokens in unified ID space.
+    """Causal transformer over interleaved melody/chord tokens with separate embeddings.
 
     Architecture:
-    - Single embedding layer for unified vocabulary (melody + chord tokens)
+    - Separate embedding layers for melody and chord vocabularies
     - Stack of transformer *encoder* layers with a causal self-attention mask
-    - Output projection to unified vocabulary
+    - Output projection to chord vocabulary only
 
     Training input format (from OnlineDataset):
         [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
 
-    - Position 0: SOS token (unified vocab)
-    - Odd positions  (1, 3, 5, ...): chord tokens (y₁, y₂, ...)
-    - Even positions (2, 4, 6, ...): melody tokens (x₁, x₂, ...)
+    - Position 0: SOS token (chord vocab space)
+    - Odd positions  (1, 3, 5, ...): chord tokens (y₁, y₂, ...) in chord vocab space
+    - Even positions (2, 4, 6, ...): melody tokens (x₁, x₂, ...) in melody vocab space
 
-    The model is optimized to predict the next token at every position. During
-    training we mask out loss contributions from melody tokens so that only
-    chord predictions are learned, mirroring the paper's setup.
+    The model uses an is_melody mask to select the appropriate embedding for each
+    position. Output logits are over chord vocabulary only.
     """
 
     def __init__(
         self,
         model_config: OnlineConfig,
         data_config: DataConfig,
-        vocab_size: int,
-        chord_token_ids: list[int] | None = None,
+        melody_vocab_size: int,
+        chord_vocab_size: int,
     ):
         super().__init__()
         self.cfg = model_config
         self.data_cfg = data_config
 
-        self.vocab_size = vocab_size
+        self.melody_vocab_size = melody_vocab_size
+        self.chord_vocab_size = chord_vocab_size
+        self.d_model = model_config.d_model
+        self.pad_id = data_config.pad_id
 
-        # Unified embedding for both melody and chord tokens
-        self.embed = nn.Embedding(
-            self.vocab_size,
+        # Separate embeddings for melody and chord tokens
+        self.melody_embed = nn.Embedding(
+            melody_vocab_size,
+            model_config.d_model,
+            padding_idx=data_config.pad_id,
+        )
+        self.chord_embed = nn.Embedding(
+            chord_vocab_size,
             model_config.d_model,
             padding_idx=data_config.pad_id,
         )
@@ -278,34 +288,9 @@ class OnlineTransformer(nn.Module):
             ]
         )
 
-        # Final normalization and projection to vocabulary
+        # Final normalization and projection to chord vocabulary only
         self.final_norm = RMSNorm(model_config.d_model)
-        self.fc_out = nn.Linear(model_config.d_model, self.vocab_size)
-
-        self.pad_id = data_config.pad_id
-
-        # Optional logits mask to constrain generation to chord tokens plus a
-        # small set of special symbols (pad/sos/eos/rest). This mirrors the
-        # paper's setup where the online model predicts chords conditioned on
-        # melody, not new melody tokens.
-        logits_mask = torch.zeros(self.vocab_size, dtype=torch.float32)
-        if chord_token_ids is not None:
-            mask = torch.full((self.vocab_size,), float("-inf"), dtype=torch.float32)
-            special_ids = {
-                self.pad_id,
-                data_config.sos_id,
-                data_config.eos_id,
-                data_config.rest_id,
-            }
-            for idx in special_ids:
-                if 0 <= idx < self.vocab_size:
-                    mask[idx] = 0.0
-            for idx in chord_token_ids:
-                if 0 <= idx < self.vocab_size:
-                    mask[idx] = 0.0
-            logits_mask = mask
-
-        self.register_buffer("logits_mask", logits_mask, persistent=False)
+        self.fc_out = nn.Linear(model_config.d_model, chord_vocab_size)
 
     def _create_causal_mask(
         self, seq_len: int, device: torch.device, past_len: int = 0
@@ -330,23 +315,28 @@ class OnlineTransformer(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        is_melody: torch.Tensor,
         past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
         """Forward pass for training or generation.
 
         Args:
-            input_ids: Interleaved tokens (batch, seq_len) in unified ID space.
+            input_ids: Interleaved tokens (batch, seq_len). Chord positions contain
+                       chord vocab IDs, melody positions contain melody vocab IDs.
                        Format: [SOS, y₁, x₁, y₂, x₂, ...]
+            is_melody: Boolean mask (batch, seq_len). True for melody positions,
+                       False for chord positions (including SOS).
             past_key_values: List of tuples of (key, value) tensors from previous step.
             use_cache: Whether to return new key/value states.
 
         Returns:
-            Logits over unified vocabulary (batch, seq_len, vocab_size)
+            Logits over chord vocabulary (batch, seq_len, chord_vocab_size)
             If use_cache is True, also returns list of new (key, value) tuples.
         """
+        batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        seq_len = input_ids.size(1)
+        dtype = self.melody_embed.weight.dtype
 
         past_len = 0
         if past_key_values is not None:
@@ -359,12 +349,21 @@ class OnlineTransformer(nn.Module):
         padding_mask = input_ids == self.pad_id
         if past_len > 0:
             # Assume past is not padded (valid context)
-            past_mask = torch.zeros((input_ids.size(0), past_len), dtype=torch.bool, device=device)
+            past_mask = torch.zeros((batch_size, past_len), dtype=torch.bool, device=device)
             padding_mask = torch.cat([past_mask, padding_mask], dim=1)
 
-        # Embed tokens; we rely on relative position bias rather than absolute
-        # positional encodings.
-        x = self.embed(input_ids)
+        # Embed tokens using separate embeddings based on is_melody mask.
+        # We use boolean indexing to avoid IndexError from out-of-range IDs.
+        x = torch.zeros(batch_size, seq_len, self.d_model, device=device, dtype=dtype)
+
+        # Embed melody positions (is_melody == True)
+        if is_melody.any():
+            x[is_melody] = self.melody_embed(input_ids[is_melody])
+
+        # Embed chord positions (is_melody == False)
+        chord_mask = ~is_melody
+        if chord_mask.any():
+            x[chord_mask] = self.chord_embed(input_ids[chord_mask])
 
         next_decoder_cache = []
 
@@ -407,12 +406,12 @@ class OnlineTransformer(nn.Module):
 
         Args:
             melody:
-                Frame-space melody token IDs in the unified vocab space,
+                Frame-space melody token IDs in melody vocab space,
                 shape (batch, melody_len). This tensor should NOT include
                 any sequence-level SOS/EOS/PAD bookkeeping; tokens are
                 passed through unchanged.
             sos_id:
-                Start-of-sequence token ID in the unified vocabulary.
+                Start-of-sequence token ID (same ID in both vocab spaces).
             eos_id:
                 Ignored in the current implementation. Generation runs for
                 one chord per available melody frame (up to the configured
@@ -425,7 +424,7 @@ class OnlineTransformer(nn.Module):
                 use greedy argmax decoding.
 
         Returns:
-            Tensor of generated token IDs in the *unified vocabulary*,
+            Tensor of generated token IDs in chord vocab space,
             shape (batch, num_steps), where
             ``num_steps = min(melody_len, data_cfg.max_len)``.
         """
@@ -444,17 +443,16 @@ class OnlineTransformer(nn.Module):
             melody = melody[:, :max_frames]
             melody_len = melody.size(1)
 
-        # Use SOS directly in unified vocab space.
-        sos_unified = sos_id
-
-        # Initialize with SOS chord token
+        # Initialize with SOS chord token (in chord vocab space)
         # Sequence format: [SOS, y₁, x₁, y₂, x₂, ...]
         input_ids = torch.full(
             (batch_size, 1),
-            sos_unified,
+            sos_id,
             dtype=torch.long,
             device=device,
         )
+        # SOS is a chord position
+        is_melody = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
 
         generated_chords: list[torch.Tensor] = []
         past_key_values = None
@@ -463,33 +461,31 @@ class OnlineTransformer(nn.Module):
             # Predict y_{t+1} given current context
             # Context is [SOS] for t=0, or [SOS, y₁, x₁, ..., y_t, x_t] for t>0
             logits, past_key_values = self.forward(
-                input_ids, past_key_values=past_key_values, use_cache=True
-            )  # (batch, seq_len, vocab)
+                input_ids, is_melody, past_key_values=past_key_values, use_cache=True
+            )  # (batch, seq_len, chord_vocab_size)
 
             # Get logits for next position (chord prediction)
-            # If input_ids has length 1 (initial), it predicts y1.
-            # If input_ids has length 2 ([y, x]), last logit predicts y_next.
-            next_logits = logits[:, -1, :]  # (batch, vocab)
-
-            # Optionally mask to chord tokens only.
-            mask = cast(torch.Tensor, self.logits_mask)
-            if mask.numel() == next_logits.size(-1):
-                next_logits = next_logits + mask
+            # Output is over chord vocab only, no masking needed
+            next_logits = logits[:, -1, :]  # (batch, chord_vocab_size)
 
             if sample:
                 probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_unified = torch.multinomial(probs, num_samples=1).squeeze(1)
+                next_chord = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
-                next_unified = next_logits.argmax(dim=-1)
+                next_chord = next_logits.argmax(dim=-1)
 
-            generated_chords.append(next_unified)
+            generated_chords.append(next_chord)
 
-            # Get current melody token
-            mel_unified = melody[:, t]
+            # Get current melody token (already in melody vocab space)
+            mel_token = melody[:, t]
 
-            # Prepare input for next step: append [y_{t+1}, x_{t+1}]
-            # This builds: [SOS, y₁, x₁, y₂, x₂, ...]
-            input_ids = torch.stack([next_unified, mel_unified], dim=1)
+            # Prepare input for next step: [chord, melody]
+            # chord is in chord vocab space, melody is in melody vocab space
+            input_ids = torch.stack([next_chord, mel_token], dim=1)
+            # is_melody mask: [False, True] for [chord, melody]
+            is_melody = torch.tensor([[False, True]], dtype=torch.bool, device=device).expand(
+                batch_size, 2
+            )
 
-        # Stack generated chords: (batch, num_chords) in unified ID space.
+        # Stack generated chords: (batch, num_chords) in chord vocab space.
         return torch.stack(generated_chords, dim=1)

@@ -131,6 +131,30 @@ def test_train_main_integration(tmp_path):
     # Assertions
     assert (checkpoints_dir / "best_model.pt").exists()
 
+    # Verify saved model produces valid outputs (lightweight sanity check)
+    melody_vocab_size = 6  # From _create_dummy_data
+    chord_vocab_size = 6
+    m_cfg = OfflineConfig(d_model=32, n_heads=4, n_layers=2)
+    d_cfg = DataConfig(max_len=16)
+
+    model = OfflineTransformer(
+        m_cfg, d_cfg, melody_vocab_size=melody_vocab_size, chord_vocab_size=chord_vocab_size
+    )
+    model.load_state_dict(torch.load(checkpoints_dir / "best_model.pt"))
+    model.eval()
+
+    # Run forward pass on dummy input
+    src = torch.tensor([[1, 4, 2]])  # [SOS, pitch_60_on, EOS]
+    tgt = torch.tensor([[1, 4, 2]])  # [SOS, chord, EOS]
+
+    with torch.no_grad():
+        logits = model(src, tgt)
+
+    # Verify output shape and values are valid
+    assert logits.shape == (1, 3, chord_vocab_size), f"Unexpected shape: {logits.shape}"
+    assert not torch.isnan(logits).any(), "Model produced NaN values"
+    assert not torch.isinf(logits).any(), "Model produced Inf values"
+
 
 def test_checkpoint_save_load(tmp_path):
     """Verify that a model can be saved and loaded correctly."""
@@ -138,16 +162,21 @@ def test_checkpoint_save_load(tmp_path):
 
     d_cfg = DataConfig(max_len=16)
     m_cfg = OfflineConfig(d_model=32, n_heads=4, n_layers=2)
-    vocab_size = 32
+    melody_vocab_size = 20
+    chord_vocab_size = 32
 
     # Create original model
-    model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
+    model = OfflineTransformer(
+        m_cfg, d_cfg, melody_vocab_size=melody_vocab_size, chord_vocab_size=chord_vocab_size
+    )
 
     # Save state dict
     torch.save(model.state_dict(), checkpoint_path)
 
     # Load new model
-    loaded_model = OfflineTransformer(m_cfg, d_cfg, vocab_size=vocab_size)
+    loaded_model = OfflineTransformer(
+        m_cfg, d_cfg, melody_vocab_size=melody_vocab_size, chord_vocab_size=chord_vocab_size
+    )
     loaded_model.load_state_dict(torch.load(checkpoint_path))
 
     # Compare parameters

@@ -182,6 +182,11 @@ def process_dataset(config: DataConfig) -> None:
         len(unified_token_to_id),
     )
 
+    # Save separate melody and chord vocabularies for models that use
+    # separate embedding tables.
+    melody_vocab.save(config.vocab_melody)
+    chord_vocab.save(config.vocab_chord)
+
     # ------------------------------------------------------------------
     # Pass 2: Tokenize and save to NPY (unified token IDs)
     # ------------------------------------------------------------------

@@ -78,6 +78,7 @@ class OfflineDataset(BaseDataset):
                 chord_frames = chord_frames[start : start + max_frames]
 
             # On-the-fly random transposition in [-max_transpose, max_transpose].
+            # Transposition operates in unified ID space.
             semitones = random.randint(
                 -self.config.max_transpose, self.config.max_transpose
             )
@@ -88,12 +89,19 @@ class OfflineDataset(BaseDataset):
             melody_frames = melody_frames[:max_frames]
             chord_frames = chord_frames[:max_frames]
 
+        # Convert chord frames from unified ID space to chord vocab space.
+        # Melody frames stay as-is (same IDs in unified and melody vocab).
+        chord_frames_converted = np.array(
+            [self._unified_to_chord_id(int(x)) for x in chord_frames], dtype=np.int64
+        )
+
         # Re-add SOS and EOS to ensure proper sequence structure
+        # SOS/EOS have same ID (1, 2) in both vocab spaces
         src_seq = np.concatenate(
             [[self.config.sos_id], melody_frames, [self.config.eos_id]]
         )
         tgt_seq = np.concatenate(
-            [[self.config.sos_id], chord_frames, [self.config.eos_id]]
+            [[self.config.sos_id], chord_frames_converted, [self.config.eos_id]]
         )
 
         return {
