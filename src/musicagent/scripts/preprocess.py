@@ -116,87 +116,22 @@ def process_dataset(config: DataConfig) -> None:
                         chord_vocab.add(f"{token}_on")
                         chord_vocab.add(f"{token}_hold")
 
-    # ------------------------------------------------------------------
-    # Unified vocabulary
-    # ------------------------------------------------------------------
-    #
-    # Build a single unified vocabulary that combines melody and chord
-    # tokens in one ID space. This mirrors the layout used by the paper:
-    #
-    #   - Special tokens (pad/sos/eos/rest) share the same IDs across
-    #     melody/chord/unified spaces.
-    #   - Melody tokens keep their existing IDs from `melody_vocab`.
-    #   - Chord tokens (excluding specials) are offset to live above the
-    #     melody range so that a single embedding table can cover both
-    #     tracks.
-    #
-    # The unified mapping is saved once at preprocessing time and is the
-    # canonical source of truth for all model/vocab operations.
-    logger.info("Building unified vocabulary...")
-
-    unified_token_to_id: dict[str, int] = {}
-
-    # 1) Copy melody tokens directly.
-    unified_token_to_id.update(melody_vocab.token_to_id)
-    melody_size = len(melody_vocab.token_to_id)
-
-    special_ids = {
-        config.pad_id,
-        config.sos_id,
-        config.eos_id,
-        config.rest_id,
-    }
-
-    # 2) Add chord tokens, sharing special IDs and offsetting the rest.
-    for token, cid in chord_vocab.token_to_id.items():
-        if cid in special_ids:
-            # Special tokens already exist in the melody vocab; ensure the
-            # mapping is consistent.
-            if token in unified_token_to_id:
-                if unified_token_to_id[token] != cid:
-                    logger.warning(
-                        "Unified vocab conflict for token %s: melody=%d, chord=%d",
-                        token,
-                        unified_token_to_id[token],
-                        cid,
-                    )
-            else:
-                unified_token_to_id[token] = cid
-        else:
-            unified_token_to_id[token] = melody_size + cid
-
-    unified_path = config.vocab_unified
-    with unified_path.open("w") as vocab_file:
-        json.dump(
-            {
-                "token_to_id": unified_token_to_id,
-                "melody_size": melody_size,
-                "chord_size": len(chord_vocab.token_to_id),
-            },
-            vocab_file,
-            indent=2,
-        )
-    logger.info(
-        "Saved unified vocabulary to %s (Size: %d)",
-        unified_path,
-        len(unified_token_to_id),
-    )
-
     # Save separate melody and chord vocabularies for models that use
-    # separate embedding tables.
+    # separate embedding tables. From this point on, all sequences on disk
+    # are stored directly in their native ID spaces:
+    #
+    #   - ``*_src.npy`` contains melody vocab IDs.
+    #   - ``*_tgt.npy`` contains chord vocab IDs.
+    #
+    # The offline and online datasets perform all transposition and decoding
+    # strictly within these separate vocabularies.
     melody_vocab.save(config.vocab_melody)
     chord_vocab.save(config.vocab_chord)
 
     # ------------------------------------------------------------------
-    # Pass 2: Tokenize and save to NPY (unified token IDs)
+    # Pass 2: Tokenize and save to NPY (separate vocab IDs)
     # ------------------------------------------------------------------
-    #
-    # From this point on, all sequences on disk use the unified ID space.
-    # The offline dataset reads `*_src.npy` / `*_tgt.npy` as melody/chord
-    # tracks in unified IDs, and the online dataset interleaves them into
-    # a single unified sequence. On‑the‑fly transposition in the Dataset
-    # uses the same unified mapping.
-    logger.info("Pass 2: Tokenizing to Numpy (unified IDs)...")
+    logger.info("Pass 2: Tokenizing to Numpy (separate melody/chord IDs)...")
 
     def _buffer_factory() -> dict[str, list[np.ndarray]]:
         return {"src": [], "tgt": []}
@@ -236,9 +171,9 @@ def process_dataset(config: DataConfig) -> None:
                     token_on = f"pitch_{tp_pitch}_on"
                     token_hold = f"pitch_{tp_pitch}_hold"
 
-                    # Look up unified IDs; fall back to REST if missing.
-                    id_on = unified_token_to_id.get(token_on, config.rest_id)
-                    id_hold = unified_token_to_id.get(token_hold, config.rest_id)
+                    # Look up melody vocab IDs; fall back to REST if missing.
+                    id_on = melody_vocab.get_id(token_on)
+                    id_hold = melody_vocab.get_id(token_hold)
 
                     for idx in range(start, min(end, total_frames)):
                         arr_idx = idx + 1
@@ -263,8 +198,9 @@ def process_dataset(config: DataConfig) -> None:
                     token_on = f"{base_token}_on"
                     token_hold = f"{base_token}_hold"
 
-                    id_on = unified_token_to_id.get(token_on, config.rest_id)
-                    id_hold = unified_token_to_id.get(token_hold, config.rest_id)
+                    # Look up chord vocab IDs; fall back to REST if missing.
+                    id_on = chord_vocab.get_id(token_on)
+                    id_hold = chord_vocab.get_id(token_hold)
 
                     for idx in range(start, min(end, total_frames)):
                         arr_idx = idx + 1

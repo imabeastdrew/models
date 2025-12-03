@@ -24,13 +24,8 @@ def _create_online_test_data(
 ) -> tuple[dict[str, int], dict[str, int]]:
     """Create a dummy dataset that matches the real preprocessing format.
 
-    This mirrors the unified‑vocab layout used by the preprocessing pipeline:
-    sequences on disk are stored in a single unified ID space with:
-
-        index 0      : SOS
-        indices 1..k : frame‑aligned tokens
-        index k+1    : EOS
-        >k+1         : PAD
+    Sequences on disk are stored directly in separate vocab ID spaces:
+    ``*_src.npy`` uses melody vocab IDs and ``*_tgt.npy`` uses chord vocab IDs.
     """
     # Melody vocab: special tokens + a single pitch
     melody_token_to_id: dict[str, int] = {
@@ -52,24 +47,7 @@ def _create_online_test_data(
         "C:4-3/0_hold": 5,
     }
 
-    # Unified vocabulary mirroring scripts/preprocess.py.
-    unified_token_to_id: dict[str, int] = {}
-    unified_token_to_id.update(melody_token_to_id)
-    melody_size = len(melody_token_to_id)
-
-    special_ids = {
-        cfg.pad_id,
-        cfg.sos_id,
-        cfg.eos_id,
-        cfg.rest_id,
-    }
-    for token, cid in chord_token_to_id.items():
-        if cid in special_ids:
-            unified_token_to_id[token] = cid
-        else:
-            unified_token_to_id[token] = melody_size + cid
-
-    _write_vocab(cfg.vocab_unified, unified_token_to_id)
+    # Write separate vocab files; unified vocab is no longer required at runtime.
     _write_vocab(cfg.vocab_melody, melody_token_to_id)
     _write_vocab(cfg.vocab_chord, chord_token_to_id)
 
@@ -81,11 +59,11 @@ def _create_online_test_data(
         # SOS at position 0
         src[i, 0] = cfg.sos_id
         tgt[i, 0] = cfg.sos_id
-        # A short melody/chord pair in unified ID space
-        src[i, 1] = unified_token_to_id["pitch_60_on"]
-        src[i, 2] = unified_token_to_id["pitch_60_hold"]
-        tgt[i, 1] = unified_token_to_id["C:4-3/0_on"]
-        tgt[i, 2] = unified_token_to_id["C:4-3/0_hold"]
+        # A short melody/chord pair in native vocab ID spaces
+        src[i, 1] = melody_token_to_id["pitch_60_on"]
+        src[i, 2] = melody_token_to_id["pitch_60_hold"]
+        tgt[i, 1] = chord_token_to_id["C:4-3/0_on"]
+        tgt[i, 2] = chord_token_to_id["C:4-3/0_hold"]
         # EOS at position 3
         eos_idx = 3
         src[i, eos_idx] = cfg.eos_id
@@ -242,8 +220,7 @@ def test_online_eval_decodes_tokens_correctly(tmp_path: Path) -> None:
         # Melody tokens should be valid melody tokens
         for token in mel_tokens:
             assert _is_valid_melody_token(token), (
-                f"Melody token decoded incorrectly as chord-like token: {token!r} "
-                f"(sequence {idx})"
+                f"Melody token decoded incorrectly as chord-like token: {token!r} (sequence {idx})"
             )
 
         # Predicted chord tokens should be valid chord tokens

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 from abc import ABC, abstractmethod
 from typing import cast
 
@@ -26,31 +27,12 @@ class BaseDataset(Dataset, ABC):
         self.config = config
         self.split = split
 
-        # Load unified vocabulary (still needed for transposition tables and
-        # backward compatibility with data stored in unified ID space).
-        if not config.vocab_unified.exists():
-            raise FileNotFoundError(
-                f"Unified vocabulary not found at {config.vocab_unified}. "
-                "Please preprocess the dataset with scripts/preprocess.py "
-                "so that all sequences and vocabularies share a unified ID space."
-            )
-
-        with open(config.vocab_unified) as f:
-            unified = json.load(f)
-        token_to_id: dict[str, int] = unified.get("token_to_id", {})
-
-        self.unified_token_to_id: dict[str, int] = token_to_id
-        self.unified_id_to_token: dict[int, str] = {idx: tok for tok, idx in token_to_id.items()}
-
-        # Expose unified vocab size. We use 1 + max(ID) rather than len(token_to_id)
-        # to remain robust to any sparse ID layouts created at preprocessing time.
-        if token_to_id:
-            self.unified_vocab_size: int = max(token_to_id.values()) + 1
-        else:
-            self.unified_vocab_size = 0
-
         # Load separate melody and chord vocabularies for models that use
-        # separate embedding tables.
+        # separate embedding tables. The preprocessing pipeline saves
+        # ``vocab_melody.json`` and ``vocab_chord.json``; sequences on disk are
+        # already stored in these native ID spaces (melody IDs for ``*_src``,
+        # chord IDs for ``*_tgt``). We no longer depend on a unified on-disk
+        # vocabulary for runtime loading.
         if not config.vocab_melody.exists():
             raise FileNotFoundError(
                 f"Melody vocabulary not found at {config.vocab_melody}. "
@@ -88,75 +70,35 @@ class BaseDataset(Dataset, ABC):
         else:
             self.chord_vocab_size = 0
 
-        # Compute offset for converting unified chord IDs to chord vocab IDs.
-        # In unified vocab, chord tokens are offset by melody_size.
-        # unified_chord_id = chord_vocab_id + _melody_offset
-        self._melody_offset = self._compute_melody_offset()
+        # Expose a synthetic "unified" vocab size equal to the sum of the
+        # melody and chord vocab sizes. This is retained for backward
+        # compatibility with helper utilities that size shared structures
+        # using a single scalar, but the model and datasets operate strictly
+        # in their respective vocab spaces.
+        self.unified_vocab_size: int = self.melody_vocab_size + self.chord_vocab_size
 
-        # Derive melody / chord views from the unified vocabulary for
-        # transposition table construction.
-        #
-        # - Melody tokens: "pitch_{midi}_on" / "pitch_{midi}_hold"
-        # - Chord tokens: "{Root}:{quality}/{inv}_on" / "_hold"
-        #
-        # Special tokens (pad/sos/eos/rest) are left out of these views and
-        # handled separately via their numeric IDs in DataConfig.
-        self.vocab_melody: dict[str, int] = {}
-        self.vocab_chord: dict[str, int] = {}
+        # Derive melody / chord views (string → ID) for transposition table
+        # construction. These simply mirror the token_to_id mappings.
+        self.vocab_melody: dict[str, int] = dict(self.melody_token_to_id)
+        self.vocab_chord: dict[str, int] = dict(self.chord_token_to_id)
 
-        for tok, idx in token_to_id.items():
-            if tok.startswith("pitch_"):
-                self.vocab_melody[tok] = idx
-            elif tok.endswith("_on") or tok.endswith("_hold"):
-                self.vocab_chord[tok] = idx
+        # Precompute the set of chord vocab IDs for fast membership checks in
+        # transposition helpers.
+        self._chord_vocab_ids: set[int] = set(self.vocab_chord.values())
 
         self._build_transposition_tables()
-
-    def _compute_melody_offset(self) -> int:
-        """Compute offset between unified and chord vocab IDs.
-
-        In the unified vocabulary, chord tokens are assigned IDs starting after
-        all melody tokens. This offset is: unified_chord_id - chord_vocab_id.
-        """
-        # Find a chord token that exists in both vocabs to compute offset
-        for token, chord_id in self.chord_token_to_id.items():
-            # Skip special tokens (they have same ID in both vocabs)
-            if token.startswith("<") or token == "rest":
-                continue
-            unified_id = self.unified_token_to_id.get(token)
-            if unified_id is not None:
-                return unified_id - chord_id
-        return 0  # fallback if no chord tokens found
-
-    def _unified_to_chord_id(self, unified_id: int) -> int:
-        """Convert a unified vocab ID to chord vocab ID.
-
-        Special tokens (0-3) have the same ID in both vocabs.
-        Chord tokens are offset: chord_id = unified_id - _melody_offset.
-        """
-        if unified_id < 4:  # Special tokens: pad, sos, eos, rest
-            return unified_id
-        return unified_id - self._melody_offset
-
-    def _unified_to_melody_id(self, unified_id: int) -> int:
-        """Convert a unified vocab ID to melody vocab ID.
-
-        Melody tokens have the same ID in unified and melody vocabs,
-        so this is an identity mapping.
-        """
-        return unified_id
 
     def _build_transposition_tables(self) -> None:
         """Pre-compute transposition tables for melody and chords."""
         max_transpose = self.config.max_transpose
-        vocab_size = self.unified_vocab_size
         num_offsets = 2 * max_transpose + 1
 
-        # Initialize with identity (default to original token ID)
-        self.melody_transpose_table = np.arange(vocab_size, dtype=np.int32)
+        # Initialize with identity (default to original token ID) in each
+        # native vocab space.
+        self.melody_transpose_table = np.arange(self.melody_vocab_size, dtype=np.int32)
         self.melody_transpose_table = np.tile(self.melody_transpose_table, (num_offsets, 1))
 
-        self.chord_transpose_table = np.arange(vocab_size, dtype=np.int32)
+        self.chord_transpose_table = np.arange(self.chord_vocab_size, dtype=np.int32)
         self.chord_transpose_table = np.tile(self.chord_transpose_table, (num_offsets, 1))
 
         # Fill tables
@@ -242,6 +184,60 @@ class BaseDataset(Dataset, ABC):
 
         # See note in _transpose_melody about NumPy typings.
         return cast(np.ndarray, self.chord_transpose_table[row_idx, seq])
+
+    # ------------------------------------------------------------------
+    # Transposition helpers used by train-time augmentation.
+    # ------------------------------------------------------------------
+
+    def _sample_safe_semitones(self, chord_frames: np.ndarray) -> int:
+        """Sample a non-zero semitone shift that safely maps all chord tokens.
+
+        Scheme B with rejection sampling:
+
+        - Consider only non-zero shifts in [-max_transpose, max_transpose].
+        - A shift ``k`` is safe for this sequence if *every* chord token ID in
+          ``chord_frames`` is mapped to a different ID by ``chord_transpose_table``
+          (i.e. there exists a corresponding transposed chord token).
+        - We sample uniformly from the set of safe non-zero shifts using
+          rejection sampling without replacement.
+        - If no such non-zero shift exists, return 0 (no transposition).
+        """
+        max_t = self.config.max_transpose
+        if max_t <= 0:
+            return 0
+
+        # Unique chord IDs present in this slice (ignore non-chord tokens).
+        unique_ids = np.unique(chord_frames)
+        chord_ids: set[int] = {int(uid) for uid in unique_ids if int(uid) in self._chord_vocab_ids}
+        if not chord_ids:
+            # No chord tokens to constrain transposition.
+            return 0
+
+        # Candidate non-zero shifts.
+        candidates = [k for k in range(-max_t, max_t + 1) if k != 0]
+        if not candidates:
+            return 0
+
+        # Rejection sampling without replacement so each safe k is equally likely.
+        while candidates:
+            k = random.choice(candidates)
+            candidates.remove(k)
+            row_idx = k + max_t
+
+            all_ok = True
+            for cid in chord_ids:
+                trans_id = int(self.chord_transpose_table[row_idx, cid])
+                # If the ID stays the same, we treat this as "no mapped chord
+                # token exists" for this semitone shift.
+                if trans_id == cid:
+                    all_ok = False
+                    break
+
+            if all_ok:
+                return k
+
+        # No non-zero shift can safely transpose all chord tokens.
+        return 0
 
     @abstractmethod
     def __len__(self) -> int:

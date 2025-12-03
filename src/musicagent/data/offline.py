@@ -61,7 +61,8 @@ class OfflineDataset(BaseDataset):
             pad_indices = np.where(src_arr == self.config.pad_id)[0]
             eos_idx = pad_indices[0] if len(pad_indices) > 0 else len(src_arr)
 
-        # Extract frames only (skip SOS at index 0, stop before EOS)
+        # Extract frames only (skip SOS at index 0, stop before EOS).
+        # On disk, src uses melody vocab IDs and tgt uses chord vocab IDs.
         melody_frames = src_arr[1:eos_idx]
         chord_frames = tgt_arr[1:eos_idx]
 
@@ -77,34 +78,23 @@ class OfflineDataset(BaseDataset):
                 melody_frames = melody_frames[start : start + max_frames]
                 chord_frames = chord_frames[start : start + max_frames]
 
-            # On-the-fly random transposition in [-max_transpose, max_transpose].
+            # Sample a semitone shift that safely maps all chord tokens in this
+            # cropped slice. If no non-zero shift is safe, this returns 0 and
+            # the sequence is left untransposed.
+            semitones = self._sample_safe_semitones(chord_frames)
 
-            # Transposition operates in unified ID space.
-            semitones = random.randint(
-                -self.config.max_transpose, self.config.max_transpose
-            )
-
-            melody_frames = self._transpose_melody(melody_frames, semitones)
-            chord_frames = self._transpose_chord(chord_frames, semitones)
+            if semitones != 0:
+                melody_frames = self._transpose_melody(melody_frames, semitones)
+                chord_frames = self._transpose_chord(chord_frames, semitones)
         else:
             # Validation/Test: Just truncate (no augmentation)
             melody_frames = melody_frames[:max_frames]
             chord_frames = chord_frames[:max_frames]
 
-        # Convert chord frames from unified ID space to chord vocab space.
-        # Melody frames stay as-is (same IDs in unified and melody vocab).
-        chord_frames_converted = np.array(
-            [self._unified_to_chord_id(int(x)) for x in chord_frames], dtype=np.int64
-        )
-
-        # Re-add SOS and EOS to ensure proper sequence structure
-        # SOS/EOS have same ID (1, 2) in both vocab spaces
-        src_seq = np.concatenate(
-            [[self.config.sos_id], melody_frames, [self.config.eos_id]]
-        )
-        tgt_seq = np.concatenate(
-            [[self.config.sos_id], chord_frames_converted, [self.config.eos_id]]
-        )
+        # Re-add SOS and EOS to ensure proper sequence structure.
+        # Special tokens share IDs across melody and chord vocabs.
+        src_seq = np.concatenate([[self.config.sos_id], melody_frames, [self.config.eos_id]])
+        tgt_seq = np.concatenate([[self.config.sos_id], chord_frames, [self.config.eos_id]])
 
         return {
             "src": torch.tensor(src_seq, dtype=torch.long),

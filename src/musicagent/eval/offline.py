@@ -100,9 +100,10 @@ def evaluate_offline(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # With separate vocabularies, melody IDs remain in unified/melody space
-    # (same IDs), but chord IDs are now in chord vocab space. We must use
-    # the appropriate mapping for each.
+    # Offline model uses strictly separate vocabularies: melody IDs are in
+    # melody vocab space and chord IDs are in chord vocab space. We therefore
+    # require explicit mappings for each and do not fall back to any unified
+    # vocabulary.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
@@ -112,14 +113,11 @@ def evaluate_offline(
         if hasattr(dataset, "melody_id_to_token") and hasattr(dataset, "chord_id_to_token"):
             id_to_melody = dataset.melody_id_to_token  # type: ignore[assignment]
             id_to_chord = dataset.chord_id_to_token  # type: ignore[assignment]
-        elif hasattr(dataset, "unified_id_to_token"):
-            # Fallback for legacy datasets without separate vocab files
-            unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
-            id_to_melody = unified_map
-            id_to_chord = unified_map
         else:
             raise ValueError(
-                "Dataset does not expose melody_id_to_token/chord_id_to_token for decoding."
+                "OfflineDataset must expose melody_id_to_token and "
+                "chord_id_to_token for decoding; unified vocab fallbacks are "
+                "no longer supported."
             )
 
     # --- 1. Test loss / perplexity (teacher-forced) ---

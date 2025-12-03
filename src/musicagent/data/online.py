@@ -121,15 +121,18 @@ class OnlineDataset(BaseDataset):
     ) -> tuple[np.ndarray, np.ndarray]:
         """Interleave melody and chord sequences: [SOS, y₁, x₁, y₂, x₂, ...].
 
-        We prepend an SOS token (as a chord) to the sequence.
-        Then we alternate chord (y) and melody (x).
+        We prepend an SOS token (as a chord) to the sequence, then alternate
+        chord (y) and melody (x). At this point:
 
-        Sequence:
-        0: SOS (Chord) - in chord vocab space
-        1: y₁ (Chord) - in chord vocab space
-        2: x₁ (Melody) - in melody vocab space
-        3: y₂ (Chord) - in chord vocab space
-        4: x₂ (Melody) - in melody vocab space
+        - ``melody_seq`` is in melody vocab ID space.
+        - ``chord_seq`` is in chord vocab ID space.
+
+        Sequence layout:
+        0: SOS (Chord)  - chord vocab space
+        1: y₁ (Chord)   - chord vocab space
+        2: x₁ (Melody)  - melody vocab space
+        3: y₂ (Chord)   - chord vocab space
+        4: x₂ (Melody)  - melody vocab space
         ...
 
         Returns:
@@ -150,12 +153,11 @@ class OnlineDataset(BaseDataset):
         is_melody[0] = False  # SOS is treated as chord position
 
         for t in range(seq_len):
-            # y_t (chord) goes to position 2*t + 1, convert to chord vocab ID
-            chord_unified_id = int(chord_seq[t])
-            interleaved[2 * t + 1] = self._unified_to_chord_id(chord_unified_id)
+            # y_t (chord) goes to position 2*t + 1, already in chord vocab ID
+            interleaved[2 * t + 1] = int(chord_seq[t])
             is_melody[2 * t + 1] = False
 
-            # x_t (melody) goes to position 2*t + 2, stays in melody vocab ID
+            # x_t (melody) goes to position 2*t + 2, already in melody vocab ID
             interleaved[2 * t + 2] = int(melody_seq[t])
             is_melody[2 * t + 2] = True
 
@@ -232,10 +234,13 @@ class OnlineDataset(BaseDataset):
             src_seq = melody_frames[frame_start:frame_end]
             tgt_seq = chord_frames[frame_start:frame_end]
 
-            # On-the-fly random transposition
-            semitones = random.randint(-self.config.max_transpose, self.config.max_transpose)
-            src_seq = self._transpose_melody(src_seq, semitones)
-            tgt_seq = self._transpose_chord(tgt_seq, semitones)
+            # Sample a semitone shift that safely maps all chord tokens in this
+            # cropped slice. If no non-zero shift is safe, this returns 0 and
+            # the sequence is left untransposed.
+            semitones = self._sample_safe_semitones(tgt_seq)
+            if semitones != 0:
+                src_seq = self._transpose_melody(src_seq, semitones)
+                tgt_seq = self._transpose_chord(tgt_seq, semitones)
         else:
             # Validation/Test: no augmentation, just truncate in frame space.
             frames_len = len(melody_frames)

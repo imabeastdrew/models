@@ -199,9 +199,9 @@ def evaluate_online(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # With separate vocabularies, melody IDs remain in unified/melody space
-    # (same IDs), but chord IDs are now in chord vocab space. We must use
-    # the appropriate mapping for each.
+    # Online model also uses separate embedding tables and vocabularies for
+    # melody and chord tokens. For evaluation we therefore require explicit
+    # per‑vocab ID→token mappings and do not fall back to any unified vocab.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
@@ -211,14 +211,11 @@ def evaluate_online(
         if hasattr(dataset, "melody_id_to_token") and hasattr(dataset, "chord_id_to_token"):
             id_to_melody = dataset.melody_id_to_token  # type: ignore[assignment]
             id_to_chord = dataset.chord_id_to_token  # type: ignore[assignment]
-        elif hasattr(dataset, "unified_id_to_token"):
-            # Fallback for legacy datasets without separate vocab files
-            unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
-            id_to_melody = unified_map
-            id_to_chord = unified_map
         else:
             raise ValueError(
-                "Dataset does not expose melody_id_to_token/chord_id_to_token for decoding."
+                "OnlineDataset must expose melody_id_to_token and "
+                "chord_id_to_token for decoding; unified vocab fallbacks are "
+                "no longer supported."
             )
 
     # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---

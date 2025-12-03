@@ -40,37 +40,17 @@ def _create_dummy_data(data_dir: Path, cfg: DataConfig):
     with open(data_dir / "vocab_chord.json", "w") as f:
         json.dump({"token_to_id": chord_vocab}, f)
 
-    # Unified vocabulary mirroring scripts/preprocess.py.
-    unified_token_to_id: dict[str, int] = {}
-    unified_token_to_id.update(melody_vocab)
-    melody_size = len(melody_vocab)
-
-    special_ids = {
-        cfg.pad_id,
-        cfg.sos_id,
-        cfg.eos_id,
-        cfg.rest_id,
-    }
-    for token, cid in chord_vocab.items():
-        if cid in special_ids:
-            unified_token_to_id[token] = cid
-        else:
-            unified_token_to_id[token] = melody_size + cid
-
-    with open(data_dir / "vocab_unified.json", "w") as f:
-        json.dump({"token_to_id": unified_token_to_id}, f)
-
-    # Create dummy numpy arrays (3 samples, length 16) in unified ID space.
+    # Create dummy numpy arrays (3 samples, length 16) in native ID spaces.
     src = np.full((3, 16), cfg.rest_id, dtype=np.int32)
     tgt = np.full((3, 16), cfg.rest_id, dtype=np.int32)
 
     # Add some content
     src[:, 0] = cfg.sos_id
-    src[:, 1] = unified_token_to_id["pitch_60_on"]
+    src[:, 1] = melody_vocab["pitch_60_on"]
     src[:, 2] = cfg.eos_id
 
     tgt[:, 0] = cfg.sos_id
-    tgt[:, 1] = unified_token_to_id["C:4-3/0_on"]
+    tgt[:, 1] = chord_vocab["C:4-3/0_on"]
     tgt[:, 2] = cfg.eos_id
 
     np.save(data_dir / "train_src.npy", src)
