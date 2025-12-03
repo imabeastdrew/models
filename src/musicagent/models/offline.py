@@ -84,6 +84,9 @@ class OfflineTransformer(nn.Module):
 
         self.model = Seq2SeqForConditionalGeneration(model_cfg)
 
+        # Enable gradient checkpointing.
+        self.model.gradient_checkpointing_enable()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------

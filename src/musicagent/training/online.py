@@ -250,6 +250,7 @@ def train_online(args: argparse.Namespace) -> None:
         melody_vocab_size=melody_vocab_size,
         chord_vocab_size=chord_vocab_size,
     ).to(device)
+
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
 

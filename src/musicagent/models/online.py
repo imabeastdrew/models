@@ -367,11 +367,15 @@ class OnlineTransformer(nn.Module):
 
         next_decoder_cache = []
 
-        # Apply stacked decoder blocks with causal + padding masks
+        # Apply stacked decoder blocks with causal + padding masks.
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
             x, present_kv = layer(
-                x, causal_mask, padding_mask, past_key_value=past_kv, use_cache=use_cache
+                x,
+                causal_mask,
+                padding_mask,
+                past_key_value=past_kv,
+                use_cache=use_cache,
             )
             if use_cache:
                 next_decoder_cache.append(present_kv)

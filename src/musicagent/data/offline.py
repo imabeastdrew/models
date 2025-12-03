@@ -68,11 +68,11 @@ class OfflineDataset(BaseDataset):
 
         frames_len = len(melody_frames)
 
-        # Reserve 2 slots for SOS and EOS in the final sequence
+        # Reserve 2 slots for SOS and EOS in the final sequence.
         max_frames = self.config.max_len - 2
 
         if self.split == "train":
-            # Random cropping for long sequences (in frame space)
+            # Random cropping for long sequences (in frame space).
             if frames_len > max_frames:
                 start = random.randint(0, frames_len - max_frames)
                 melody_frames = melody_frames[start : start + max_frames]
@@ -87,7 +87,7 @@ class OfflineDataset(BaseDataset):
                 melody_frames = self._transpose_melody(melody_frames, semitones)
                 chord_frames = self._transpose_chord(chord_frames, semitones)
         else:
-            # Validation/Test: Just truncate (no augmentation)
+            # Validation/Test: Just truncate (no augmentation).
             melody_frames = melody_frames[:max_frames]
             chord_frames = chord_frames[:max_frames]
 
