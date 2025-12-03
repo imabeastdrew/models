@@ -11,9 +11,12 @@ from .artifacts import ArtifactPaths, download_wandb_artifact
 from .config import load_configs_from_dir
 from .core import safe_load_state_dict, seed_everything, setup_logging
 from .loaders import (
+    EvaluationRun,
     LoadedModel,
     TestLoaderResult,
     create_test_loader,
+    evaluate_artifact,
+    evaluate_checkpoint,
     load_model_from_artifact,
 )
 from .registry import ModelConfigT, ModelRegistry, ModelType, get_model_registry
@@ -40,10 +43,14 @@ __all__ = [
     "ArtifactPaths",
     "download_wandb_artifact",
     # Loaders
+    "EvaluationRun",
     "LoadedModel",
-    "load_model_from_artifact",
     "TestLoaderResult",
     "create_test_loader",
+    "evaluate_checkpoint",
+    "evaluate_artifact",
+    "evaluate_wandb_artifact",
+    "load_model_from_artifact",
     # Analysis
     "AdaptationDynamicsResult",
     "compute_adaptation_dynamics",

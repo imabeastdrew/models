@@ -78,10 +78,12 @@ class OfflineDataset(BaseDataset):
                 chord_frames = chord_frames[start : start + max_frames]
 
             # On-the-fly random transposition in [-max_transpose, max_transpose].
+
             # Transposition operates in unified ID space.
             semitones = random.randint(
                 -self.config.max_transpose, self.config.max_transpose
             )
+
             melody_frames = self._transpose_melody(melody_frames, semitones)
             chord_frames = self._transpose_chord(chord_frames, semitones)
         else:
