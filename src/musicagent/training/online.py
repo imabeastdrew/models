@@ -62,10 +62,11 @@ def train_steps(
     total_loss = 0.0
     start_time = time.time()
 
-    for i, input_ids in enumerate(loader):
+    for i, batch in enumerate(loader):
         if max_steps is not None and global_step >= max_steps:
             break
-        input_ids = input_ids.to(device)
+        input_ids = batch["input_ids"].to(device)
+        is_melody = batch["is_melody"].to(device)
 
         # Standard next-token prediction over the interleaved sequence:
         #
@@ -74,6 +75,7 @@ def train_steps(
         #   targets      = [y₁,  x₁, y₂, ..., yₙ, xₙ]  (shifted left by 1)
         #
         inputs = input_ids[:, :-1]
+        is_melody_inputs = is_melody[:, :-1]
         targets = input_ids[:, 1:].clone()
 
         # Mask out melody positions in the target so we only optimize chords.
@@ -83,7 +85,7 @@ def train_steps(
         targets[:, 1::2] = pad_id
 
         optimizer.zero_grad(set_to_none=True)
-        output = model(inputs)
+        output = model(inputs, is_melody_inputs)
 
         # Flatten for loss computation
         loss = criterion(output.reshape(-1, output.size(-1)), targets.reshape(-1))
@@ -138,17 +140,19 @@ def evaluate(model, loader, criterion, device):
     total_tokens = 0
 
     with torch.no_grad():
-        for input_ids in loader:
-            input_ids = input_ids.to(device)
+        for batch in loader:
+            input_ids = batch["input_ids"].to(device)
+            is_melody = batch["is_melody"].to(device)
 
             inputs = input_ids[:, :-1]
+            is_melody_inputs = is_melody[:, :-1]
             targets = input_ids[:, 1:].clone()
 
             # Apply the same chord-only masking used in training.
             pad_id = model.pad_id
             targets[:, 1::2] = pad_id
 
-            output = model(inputs)
+            output = model(inputs, is_melody_inputs)
 
             flat_output = output.reshape(-1, output.size(-1))
             flat_targets = targets.reshape(-1)
@@ -232,20 +236,19 @@ def train_online(args: argparse.Namespace) -> None:
     # Get vocab sizes from dataset
     melody_vocab_size = train_ds.melody_vocab_size
     chord_vocab_size = train_ds.chord_vocab_size
-    unified_vocab_size = train_ds.unified_vocab_size
     logger.info(
-        "Vocab Size: Melody=%d, Chord=%d, Unified=%d",
+        "Vocab Size: Melody=%d, Chord=%d",
         melody_vocab_size,
         chord_vocab_size,
-        unified_vocab_size,
     )
 
-    chord_token_ids = sorted(train_ds.vocab_chord.values())
+    # Online model uses separate embedding tables for melody and chord tokens.
+    # During forward pass, is_melody mask selects which embedding to apply.
     model = OnlineTransformer(
         m_cfg,
         d_cfg,
-        vocab_size=unified_vocab_size,
-        chord_token_ids=chord_token_ids,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
     ).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
@@ -306,7 +309,6 @@ def train_online(args: argparse.Namespace) -> None:
                 "grad_clip": 0.5,
                 "melody_vocab_size": melody_vocab_size,
                 "chord_vocab_size": chord_vocab_size,
-                "unified_vocab_size": unified_vocab_size,
                 "total_params": total_params,
                 "train_samples": len(train_ds),
                 "valid_samples": len(valid_ds),

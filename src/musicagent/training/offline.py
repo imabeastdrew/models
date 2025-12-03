@@ -226,25 +226,22 @@ def train_offline(args: argparse.Namespace) -> None:
         collate_fn=collate,
     )
 
-    vocab_src_len = len(train_ds.vocab_melody)
-    vocab_tgt_len = len(train_ds.vocab_chord)
-    unified_vocab_size = train_ds.unified_vocab_size
+    melody_vocab_size = train_ds.melody_vocab_size
+    chord_vocab_size = train_ds.chord_vocab_size
     logger.info(
-        "Vocab Size: Melody=%d, Chord=%d, Unified=%d",
-        vocab_src_len,
-        vocab_tgt_len,
-        unified_vocab_size,
+        "Vocab Size: Melody=%d, Chord=%d",
+        melody_vocab_size,
+        chord_vocab_size,
     )
 
-    # Offline model now operates directly in the unified token space. We also
-    # pass the set of chord token IDs so that generation can be constrained to
-    # chord symbols only.
-    chord_token_ids = sorted(train_ds.vocab_chord.values())
+    # Offline model uses separate embedding tables for melody (encoder) and
+    # chord (decoder) tokens, allowing each modality to develop task-appropriate
+    # representations without competing for shared embedding space.
     model = OfflineTransformer(
         m_cfg,
         d_cfg,
-        vocab_size=unified_vocab_size,
-        chord_token_ids=chord_token_ids,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
     ).to(device)
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
@@ -299,8 +296,8 @@ def train_offline(args: argparse.Namespace) -> None:
                 "storage_len": d_cfg.storage_len,
                 "weight_decay": 0.0,
                 "grad_clip": 0.5,
-                "vocab_src_size": vocab_src_len,
-                "vocab_tgt_size": vocab_tgt_len,
+                "melody_vocab_size": melody_vocab_size,
+                "chord_vocab_size": chord_vocab_size,
                 "total_params": total_params,
                 "train_samples": len(train_ds),
                 "valid_samples": len(valid_ds),

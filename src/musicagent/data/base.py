@@ -26,8 +26,8 @@ class BaseDataset(Dataset, ABC):
         self.config = config
         self.split = split
 
-        # In the current pipeline we require a unified vocabulary produced by
-        # ``scripts/preprocess.py``.
+        # Load unified vocabulary (still needed for transposition tables and
+        # backward compatibility with data stored in unified ID space).
         if not config.vocab_unified.exists():
             raise FileNotFoundError(
                 f"Unified vocabulary not found at {config.vocab_unified}. "
@@ -42,16 +42,59 @@ class BaseDataset(Dataset, ABC):
         self.unified_token_to_id: dict[str, int] = token_to_id
         self.unified_id_to_token: dict[int, str] = {idx: tok for tok, idx in token_to_id.items()}
 
-        # Expose unified vocab size for models that operate directly in this
-        # space. We use 1 + max(ID) rather than len(token_to_id) to remain
-        # robust to any sparse ID layouts created at preprocessing time.
+        # Expose unified vocab size. We use 1 + max(ID) rather than len(token_to_id)
+        # to remain robust to any sparse ID layouts created at preprocessing time.
         if token_to_id:
             self.unified_vocab_size: int = max(token_to_id.values()) + 1
         else:
             self.unified_vocab_size = 0
 
-        # Derive melody / chord views from the unified vocabulary based on
-        # token naming conventions used in preprocessing.
+        # Load separate melody and chord vocabularies for models that use
+        # separate embedding tables.
+        if not config.vocab_melody.exists():
+            raise FileNotFoundError(
+                f"Melody vocabulary not found at {config.vocab_melody}. "
+                "Please preprocess the dataset with scripts/preprocess.py."
+            )
+        if not config.vocab_chord.exists():
+            raise FileNotFoundError(
+                f"Chord vocabulary not found at {config.vocab_chord}. "
+                "Please preprocess the dataset with scripts/preprocess.py."
+            )
+
+        with open(config.vocab_melody) as f:
+            melody_vocab = json.load(f)
+        with open(config.vocab_chord) as f:
+            chord_vocab = json.load(f)
+
+        self.melody_token_to_id: dict[str, int] = melody_vocab.get("token_to_id", {})
+        self.chord_token_to_id: dict[str, int] = chord_vocab.get("token_to_id", {})
+
+        self.melody_id_to_token: dict[int, str] = {
+            idx: tok for tok, idx in self.melody_token_to_id.items()
+        }
+        self.chord_id_to_token: dict[int, str] = {
+            idx: tok for tok, idx in self.chord_token_to_id.items()
+        }
+
+        # Compute vocab sizes dynamically from max ID + 1 to handle sparse layouts.
+        if self.melody_token_to_id:
+            self.melody_vocab_size: int = max(self.melody_token_to_id.values()) + 1
+        else:
+            self.melody_vocab_size = 0
+
+        if self.chord_token_to_id:
+            self.chord_vocab_size: int = max(self.chord_token_to_id.values()) + 1
+        else:
+            self.chord_vocab_size = 0
+
+        # Compute offset for converting unified chord IDs to chord vocab IDs.
+        # In unified vocab, chord tokens are offset by melody_size.
+        # unified_chord_id = chord_vocab_id + _melody_offset
+        self._melody_offset = self._compute_melody_offset()
+
+        # Derive melody / chord views from the unified vocabulary for
+        # transposition table construction.
         #
         # - Melody tokens: "pitch_{midi}_on" / "pitch_{midi}_hold"
         # - Chord tokens: "{Root}:{quality}/{inv}_on" / "_hold"
@@ -68,6 +111,40 @@ class BaseDataset(Dataset, ABC):
                 self.vocab_chord[tok] = idx
 
         self._build_transposition_tables()
+
+    def _compute_melody_offset(self) -> int:
+        """Compute offset between unified and chord vocab IDs.
+
+        In the unified vocabulary, chord tokens are assigned IDs starting after
+        all melody tokens. This offset is: unified_chord_id - chord_vocab_id.
+        """
+        # Find a chord token that exists in both vocabs to compute offset
+        for token, chord_id in self.chord_token_to_id.items():
+            # Skip special tokens (they have same ID in both vocabs)
+            if token.startswith("<") or token == "rest":
+                continue
+            unified_id = self.unified_token_to_id.get(token)
+            if unified_id is not None:
+                return unified_id - chord_id
+        return 0  # fallback if no chord tokens found
+
+    def _unified_to_chord_id(self, unified_id: int) -> int:
+        """Convert a unified vocab ID to chord vocab ID.
+
+        Special tokens (0-3) have the same ID in both vocabs.
+        Chord tokens are offset: chord_id = unified_id - _melody_offset.
+        """
+        if unified_id < 4:  # Special tokens: pad, sos, eos, rest
+            return unified_id
+        return unified_id - self._melody_offset
+
+    def _unified_to_melody_id(self, unified_id: int) -> int:
+        """Convert a unified vocab ID to melody vocab ID.
+
+        Melody tokens have the same ID in unified and melody vocabs,
+        so this is an identity mapping.
+        """
+        return unified_id
 
     def _build_transposition_tables(self) -> None:
         """Pre-compute transposition tables for melody and chords."""

@@ -110,6 +110,60 @@ def extract_melody_and_chords(
     return melody_frames, chord_unified_frames
 
 
+def extract_melody_and_chords_from_mask(
+    input_ids: torch.Tensor,
+    is_melody: torch.Tensor,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract melody frames and reference chord frames using is_melody mask.
+
+    With separate vocabs, input_ids contains:
+    - Melody tokens in melody vocab space at is_melody=True positions
+    - Chord tokens in chord vocab space at is_melody=False positions
+
+    OnlineDataset format: [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
+    - Position 0: SOS (chord, is_melody=False)
+    - Odd positions (1, 3, 5, ...): chord tokens (is_melody=False)
+    - Even positions (2, 4, 6, ...): melody tokens (is_melody=True)
+
+    Args:
+        input_ids: Interleaved sequence tensor with native vocab IDs.
+        is_melody: Boolean mask, True for melody positions.
+        pad_id: Padding token ID.
+
+    Returns:
+        melody_frames: Tensor of melody token IDs (melody vocab space).
+        ref_chord_frames: Tensor of chord token IDs (chord vocab space).
+    """
+    # Skip SOS at position 0
+    seq = input_ids[1:]  # Now: [y₁, x₁, y₂, x₂, ...]
+    mask = is_melody[1:]
+
+    # Extract chord and melody using mask
+    # Chord positions: is_melody=False after SOS (positions 0, 2, 4, ...)
+    # Melody positions: is_melody=True (positions 1, 3, 5, ...)
+    chord_mask = ~mask
+    melody_mask = mask
+
+    # Get indices
+    chord_indices = torch.where(chord_mask)[0]
+    melody_indices = torch.where(melody_mask)[0]
+
+    chord_frames = seq[chord_indices]
+    melody_frames = seq[melody_indices]
+
+    # Find valid length (non-PAD in melody)
+    pad_mask = melody_frames == pad_id
+    first_pad = pad_mask.nonzero(as_tuple=True)[0]
+    valid_len = int(first_pad[0].item()) if len(first_pad) > 0 else len(melody_frames)
+
+    # Truncate both to valid length (should be same length)
+    melody_frames = melody_frames[:valid_len]
+    chord_frames = chord_frames[:valid_len]
+
+    return melody_frames, chord_frames
+
+
 def evaluate_online(
     model: OnlineTransformer,
     test_loader: DataLoader,
@@ -145,21 +199,27 @@ def evaluate_online(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # In the unified pipeline, sequences on disk already use the unified ID
-    # space produced by preprocessing. If explicit mappings are not provided, we
-    # always decode via this unified vocabulary.
+    # With separate vocabularies, melody IDs remain in unified/melody space
+    # (same IDs), but chord IDs are now in chord vocab space. We must use
+    # the appropriate mapping for each.
     if id_to_melody is None or id_to_chord is None:
         if dataset is None:
             raise ValueError(
                 "id_to_melody/id_to_chord not provided and test_loader has no dataset."
             )
 
-        if hasattr(dataset, "unified_id_to_token"):
+        if hasattr(dataset, "melody_id_to_token") and hasattr(dataset, "chord_id_to_token"):
+            id_to_melody = dataset.melody_id_to_token  # type: ignore[assignment]
+            id_to_chord = dataset.chord_id_to_token  # type: ignore[assignment]
+        elif hasattr(dataset, "unified_id_to_token"):
+            # Fallback for legacy datasets without separate vocab files
             unified_map: dict[int, str] = dataset.unified_id_to_token  # type: ignore[assignment]
             id_to_melody = unified_map
             id_to_chord = unified_map
         else:
-            raise ValueError("Dataset does not expose unified_id_to_token for decoding.")
+            raise ValueError(
+                "Dataset does not expose melody_id_to_token/chord_id_to_token for decoding."
+            )
 
     # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, reduction="sum")
@@ -170,13 +230,15 @@ def evaluate_online(
         logger.info("Computing teacher-forced test loss (chord positions only)...")
 
     with torch.no_grad():
-        for interleaved_batch in test_loader:
-            interleaved_batch = interleaved_batch.to(device)
+        for batch in test_loader:
+            input_ids_full = batch["input_ids"].to(device)
+            is_melody_full = batch["is_melody"].to(device)
 
-            input_ids = interleaved_batch[:, :-1]
-            target_ids = interleaved_batch[:, 1:]
+            input_ids = input_ids_full[:, :-1]
+            is_melody_input = is_melody_full[:, :-1]
+            target_ids = input_ids_full[:, 1:]
 
-            logits = model(input_ids)
+            logits = model(input_ids, is_melody_input)
 
             batch_size, seq_len = target_ids.shape
             chord_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
@@ -235,16 +297,18 @@ def evaluate_online(
         return eos_idx < last_mel_idx
 
     with torch.no_grad():
-        for batch_idx, interleaved_batch in enumerate(test_loader):
-            interleaved_batch = interleaved_batch.to(device)
-            batch_size = interleaved_batch.size(0)
+        for batch_idx, batch in enumerate(test_loader):
+            input_ids_batch = batch["input_ids"].to(device)
+            is_melody_batch = batch["is_melody"].to(device)
+            batch_size = input_ids_batch.size(0)
 
             for i in range(batch_size):
-                interleaved = interleaved_batch[i]
+                input_ids = input_ids_batch[i]
+                is_melody = is_melody_batch[i]
 
-                melody_frames, ref_chord_frames = extract_melody_and_chords(
-                    interleaved,
-                    melody_vocab_size,
+                melody_frames, ref_chord_frames = extract_melody_and_chords_from_mask(
+                    input_ids,
+                    is_melody,
                     d_cfg.pad_id,
                 )
 
@@ -360,16 +424,14 @@ def main():
         collate_fn=collate,
     )
 
+    # Load model with separate vocab sizes
     melody_vocab_size = test_ds.melody_vocab_size
-
-    # Load model in unified ID space
-    vocab_size = test_ds.unified_vocab_size
-    chord_token_ids = sorted(test_ds.vocab_chord.values())
+    chord_vocab_size = test_ds.chord_vocab_size
     model = OnlineTransformer(
         m_cfg,
         d_cfg,
-        vocab_size=vocab_size,
-        chord_token_ids=chord_token_ids,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
     ).to(device)
     state_dict = safe_load_state_dict(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)

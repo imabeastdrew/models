@@ -89,25 +89,10 @@ class OnlineDataset(BaseDataset):
                 "check preprocessing and DataConfig settings."
             )
 
-        # Build unified vocabulary views (melody tokens + chord tokens).
-        #
-        # `BaseDataset` has already loaded the unified vocabulary created at
-        # preprocessing time, exposing:
-        #   - `unified_vocab_size`
-        #   - `vocab_melody` / `vocab_chord` (excluding specials)
-        #
-        # For convenience (training logs, tests) we expose logical per-track
-        # vocab sizes that *include* the shared special tokens.
-        special_ids = {
-            self.config.pad_id,
-            self.config.sos_id,
-            self.config.eos_id,
-            self.config.rest_id,
-        }
-        num_specials = len(special_ids)
-
-        self.melody_vocab_size = len(self.vocab_melody) + num_specials
-        self.chord_vocab_size = len(self.vocab_chord) + num_specials
+        # `BaseDataset` has already loaded the separate melody and chord
+        # vocabularies, exposing `melody_vocab_size` and `chord_vocab_size`
+        # computed from the separate vocab files. We use those inherited values
+        # directly rather than recalculating from the unified vocab views.
 
     def _melody_to_unified(self, token_id: int) -> int:
         """Convert melody token ID to unified vocab ID.
@@ -133,35 +118,48 @@ class OnlineDataset(BaseDataset):
         self,
         melody_seq: np.ndarray,
         chord_seq: np.ndarray,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Interleave melody and chord sequences: [SOS, y₁, x₁, y₂, x₂, ...].
 
         We prepend an SOS token (as a chord) to the sequence.
         Then we alternate chord (y) and melody (x).
 
         Sequence:
-        0: SOS (Chord)
-        1: y₁ (Chord)
-        2: x₁ (Melody)
-        3: y₂ (Chord)
-        4: x₂ (Melody)
+        0: SOS (Chord) - in chord vocab space
+        1: y₁ (Chord) - in chord vocab space
+        2: x₁ (Melody) - in melody vocab space
+        3: y₂ (Chord) - in chord vocab space
+        4: x₂ (Melody) - in melody vocab space
         ...
+
+        Returns:
+            interleaved: Token IDs where chord positions use chord vocab IDs
+                        and melody positions use melody vocab IDs.
+            is_melody: Boolean mask, True for melody positions (even indices > 0).
         """
         seq_len = len(melody_seq)
-        # Add space for SOS at the beginning
-        interleaved = np.zeros(seq_len * 2 + 1, dtype=np.int64)
+        total_len = seq_len * 2 + 1
 
-        # Prepend SOS (as chord token)
-        # Use the SOS ID from config, mapped to unified chord vocab space
-        interleaved[0] = self._chord_to_unified(self.config.sos_id)
+        # Add space for SOS at the beginning
+        interleaved = np.zeros(total_len, dtype=np.int64)
+        is_melody = np.zeros(total_len, dtype=np.bool_)
+
+        # Prepend SOS (as chord token in chord vocab space)
+        # SOS has same ID (1) in both vocab spaces
+        interleaved[0] = self.config.sos_id
+        is_melody[0] = False  # SOS is treated as chord position
 
         for t in range(seq_len):
-            # y_t goes to 2*t + 1
-            interleaved[2 * t + 1] = self._chord_to_unified(chord_seq[t])
-            # x_t goes to 2*t + 2
-            interleaved[2 * t + 2] = self._melody_to_unified(melody_seq[t])
+            # y_t (chord) goes to position 2*t + 1, convert to chord vocab ID
+            chord_unified_id = int(chord_seq[t])
+            interleaved[2 * t + 1] = self._unified_to_chord_id(chord_unified_id)
+            is_melody[2 * t + 1] = False
 
-        return interleaved
+            # x_t (melody) goes to position 2*t + 2, stays in melody vocab ID
+            interleaved[2 * t + 2] = int(melody_seq[t])
+            is_melody[2 * t + 2] = True
+
+        return interleaved, is_melody
 
     def __len__(self) -> int:
         """Number of sequences with at least one usable frame."""
@@ -252,12 +250,14 @@ class OnlineDataset(BaseDataset):
             tgt_seq = chord_frames[:usable_len]
 
         # Interleave: [SOS, y₁, x₁, y₂, x₂, ...]
-        interleaved = self._interleave(src_seq, tgt_seq)
+        # Returns (interleaved_ids, is_melody_mask)
+        interleaved, is_melody = self._interleave(src_seq, tgt_seq)
 
         # For language modeling, input is [:-1] and target is [1:]
         # But we return the full sequence; the training loop handles the shift
         return {
             "input_ids": torch.tensor(interleaved, dtype=torch.long),
+            "is_melody": torch.tensor(is_melody, dtype=torch.bool),
         }
 
 
@@ -268,34 +268,54 @@ def make_online_collate_fn(pad_id: int = 0):
         pad_id: Token ID used for padding (should match DataConfig.pad_id).
 
     Returns:
-        A collate function that pads sequences to uniform length.
+        A collate function that pads sequences to uniform length and returns
+        a dictionary with both input_ids and is_melody tensors.
     """
 
-    def collate_fn(batch: list) -> torch.Tensor:
-        """Collate function for online dataset (single interleaved sequence).
+    def collate_fn(batch: list) -> dict[str, torch.Tensor]:
+        """Collate function for online dataset (interleaved sequence + mask).
 
         Online sequences are variable-length (due to cropping at the frame level),
-        so we right-pad them to a common length for batching.
+        so we right-pad them to a common length for batching. The is_melody mask
+        is padded with False (padding positions are treated as chord positions
+        but will be ignored via attention mask).
         """
         sequences = [x["input_ids"] for x in batch]
+        masks = [x["is_melody"] for x in batch]
+
         if not sequences:
-            return torch.empty(0, 0, dtype=torch.long)
+            return {
+                "input_ids": torch.empty(0, 0, dtype=torch.long),
+                "is_melody": torch.empty(0, 0, dtype=torch.bool),
+            }
 
         max_len = max(seq.size(0) for seq in sequences)
         device = sequences[0].device
-        dtype = sequences[0].dtype
 
-        padded = torch.full(
+        # Pad input_ids with pad_id
+        padded_ids = torch.full(
             (len(sequences), max_len),
             fill_value=pad_id,
-            dtype=dtype,
+            dtype=torch.long,
             device=device,
         )
 
-        for i, seq in enumerate(sequences):
-            length = seq.size(0)
-            padded[i, :length] = seq
+        # Pad is_melody with False (pad positions treated as chord for embedding,
+        # but will be masked out in attention anyway)
+        padded_mask = torch.zeros(
+            (len(sequences), max_len),
+            dtype=torch.bool,
+            device=device,
+        )
 
-        return padded
+        for i, (seq, mask) in enumerate(zip(sequences, masks)):
+            length = seq.size(0)
+            padded_ids[i, :length] = seq
+            padded_mask[i, :length] = mask
+
+        return {
+            "input_ids": padded_ids,
+            "is_melody": padded_mask,
+        }
 
     return collate_fn

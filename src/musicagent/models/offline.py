@@ -4,14 +4,13 @@ The offline model sees the complete melody sequence before generating chords.
 
 This module provides an ``OfflineTransformer`` with a simple interface:
 
-- ``forward(src, tgt) -> logits`` where both ``src`` and ``tgt`` are integer
-  IDs in a unified vocabulary shared between melody and chord tokens.
+- ``forward(src, tgt) -> logits`` where ``src`` contains melody token IDs in
+  melody vocab space and ``tgt`` contains chord token IDs in chord vocab space.
 - ``generate(src, max_len, sos_id, eos_id, temperature, sample)`` which
-  returns generated token IDs in this same unified vocabulary.
+  returns generated token IDs in chord vocab space.
 
-Internally we operate purely in this unified token space (mirroring the online
-model); higher-level utilities such as datasets and decoders are responsible
-for mapping between unified IDs and human-readable melody/chord tokens.
+The model uses separate embedding tables for melody (encoder) and chord (decoder)
+tokens, allowing each modality to develop task-appropriate representations.
 """
 
 from __future__ import annotations
@@ -20,112 +19,58 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from transformers import (
-    LogitsProcessor,
-    LogitsProcessorList,
-)
-from transformers import (
-    T5Config as Seq2SeqConfig,
-)
-from transformers import (
-    T5ForConditionalGeneration as Seq2SeqForConditionalGeneration,
-)
+from transformers import T5Config as Seq2SeqConfig
+from transformers import T5ForConditionalGeneration as Seq2SeqForConditionalGeneration
 
 from musicagent.config import DataConfig, OfflineConfig
-
-
-class _ChordOnlyLogitsProcessor(LogitsProcessor):
-    """Logits processor that masks out non-chord tokens during generation.
-
-    The processor keeps a CPU copy of the base mask and lazily materializes
-    per-(device, dtype) views to avoid device mismatches when the model is
-    moved (e.g., via ``model.to("cuda")``) and to reduce repeated transfers.
-    """
-
-    def __init__(self, mask: torch.Tensor):
-        # Store a canonical float32 CPU copy; per-device views are created
-        # on demand in ``_mask_for``.
-        self._base_mask = mask.detach().clone().to("cpu", dtype=torch.float32)
-        self._cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-
-    def _mask_for(self, scores: torch.Tensor) -> torch.Tensor:
-        key = (scores.device, scores.dtype)
-        if key not in self._cache:
-            self._cache[key] = self._base_mask.to(scores.device, dtype=scores.dtype)
-        return self._cache[key]
-
-    def __call__(
-        self,
-        input_ids: torch.LongTensor,
-        scores: torch.Tensor,
-    ) -> torch.Tensor:
-        mask = self._mask_for(scores)
-        if mask.numel() == scores.size(-1):
-            return scores + mask
-        return scores
 
 
 class OfflineTransformer(nn.Module):
     """Encoder–decoder transformer for offline chord generation.
 
-    The model operates purely in the unified token ID space emitted by
-    preprocessing. Both melody (encoder input) and chords (decoder input /
-    output) are represented as integer IDs in this shared vocabulary.
+    The model uses separate vocabularies for melody (encoder) and chord (decoder):
+    - Encoder input: melody token IDs in melody vocab space
+    - Decoder input/output: chord token IDs in chord vocab space
+
+    This separation allows cleaner gradient flow and task-appropriate embeddings
+    for each modality.
     """
 
     def __init__(
         self,
         model_config: OfflineConfig,
         data_config: DataConfig,
-        vocab_size: int,
-        chord_token_ids: list[int] | None = None,
+        melody_vocab_size: int,
+        chord_vocab_size: int,
     ):
-        """Create an offline encoder–decoder model.
+        """Create an offline encoder–decoder model with separate vocabularies.
 
         Args:
             model_config: OfflineConfig with architecture hyperparameters.
             data_config: DataConfig with token IDs (pad/sos/eos, max_len, ...).
-            vocab_size: Size of the unified token vocabulary.
-            chord_token_ids: Optional list of token IDs that correspond to
-                chord symbols. When provided, generation will be constrained
-                to this set (plus special tokens) by masking logits.
+            melody_vocab_size: Size of the melody token vocabulary.
+            chord_vocab_size: Size of the chord token vocabulary.
         """
         super().__init__()
         self.cfg = model_config
         self.data_cfg = data_config
 
-        self.vocab_size = vocab_size
+        self.melody_vocab_size = melody_vocab_size
+        self.chord_vocab_size = chord_vocab_size
         self.pad_id = data_config.pad_id
 
-        # ------------------------------------------------------------------
-        # Logits mask for generation (optional chord-only decoding)
-        # ------------------------------------------------------------------
-        logits_mask = torch.zeros(self.vocab_size, dtype=torch.float32)
-        if chord_token_ids is not None:
-            # Disallow everything except chord tokens and a few special tokens.
-            mask = torch.full((self.vocab_size,), float("-inf"), dtype=torch.float32)
-            special_ids = {
-                self.pad_id,
-                data_config.sos_id,
-                data_config.eos_id,
-                data_config.rest_id,
-            }
-            for idx in special_ids:
-                if 0 <= idx < self.vocab_size:
-                    mask[idx] = 0.0
-            for idx in chord_token_ids:
-                if 0 <= idx < self.vocab_size:
-                    mask[idx] = 0.0
-            logits_mask = mask
+        # Custom encoder embedding for melody tokens (separate from T5's internal
+        # embedding which is used for decoder/chord tokens).
+        self.encoder_embed = nn.Embedding(
+            melody_vocab_size,
+            model_config.d_model,
+            padding_idx=data_config.pad_id,
+        )
 
-        self.register_buffer("logits_mask", logits_mask, persistent=False)
-
-        # Configure a compact encoder–decoder transformer matching our
-        # OfflineConfig dimensions. We keep the architecture close to the
-        # original paper: d_model=512, n_layers=8, etc., but allow overrides
-        # via OfflineConfig.
+        # Configure T5 with chord vocab size. T5's internal embedding will be
+        # used for decoder (chord tokens). We override encoder embedding manually.
         model_cfg = Seq2SeqConfig(
-            vocab_size=self.vocab_size,
+            vocab_size=chord_vocab_size,
             d_model=model_config.d_model,
             d_ff=model_config.d_model * 4,
             num_heads=model_config.n_heads,
@@ -147,14 +92,17 @@ class OfflineTransformer(nn.Module):
         """Forward pass with teacher forcing.
 
         Args:
-            src: Source melody tokens (batch, src_len) in unified vocab space.
-            tgt: Target chord tokens (batch, tgt_len) in unified vocab space.
+            src: Source melody tokens (batch, src_len) in melody vocab space.
+            tgt: Target chord tokens (batch, tgt_len) in chord vocab space.
 
         Returns:
-            Logits over the unified vocabulary (batch, tgt_len, vocab_size).
+            Logits over the chord vocabulary (batch, tgt_len, chord_vocab_size).
         """
+        # Embed melody with our custom encoder embedding
+        encoder_embeds = self.encoder_embed(src)
+
         outputs = self.model(
-            input_ids=src,
+            inputs_embeds=encoder_embeds,
             attention_mask=src.ne(self.pad_id),
             decoder_input_ids=tgt,
             use_cache=False,
@@ -176,34 +124,35 @@ class OfflineTransformer(nn.Module):
     ) -> torch.Tensor:
         """Autoregressively generate a chord sequence given a melody.
 
-        This mirrors the original CLI/eval interface while delegating the heavy
-        lifting to :meth:`transformers.T5ForConditionalGeneration.generate`,
-        which uses the model's built-in KV cache for efficient decoding.
+        This uses custom encoder embeddings for melody, then delegates decoding
+        to HuggingFace's generate() which uses T5's internal chord embeddings.
 
         Args:
-            src: (batch, src_len) melody token IDs in unified vocab space.
+            src: (batch, src_len) melody token IDs in melody vocab space.
             max_len: Maximum number of chord tokens to generate.
-            sos_id: Start-of-sequence token ID in the unified vocabulary.
-            eos_id: End-of-sequence token ID in the unified vocabulary.
+            sos_id: Start-of-sequence token ID (same in both vocab spaces).
+            eos_id: End-of-sequence token ID (same in both vocab spaces).
             temperature: Softmax temperature (used only when ``sample=True``).
             sample: If True, sample from the distribution; otherwise greedy.
 
         Returns:
-            (batch, generated_len) token IDs in the unified vocabulary.
+            (batch, generated_len) token IDs in chord vocab space.
         """
+        # Step 1: Embed melody with our custom encoder embedding
+        encoder_embeds = self.encoder_embed(src)
         encoder_attention_mask = src.ne(self.pad_id)
 
-        # Logits processor for chord-only decoding (optional).
-        mask = cast(torch.Tensor, self.logits_mask)
-        logits_processors = LogitsProcessorList()
-        if mask.numel() == self.vocab_size:
-            logits_processors.append(_ChordOnlyLogitsProcessor(mask))
+        # Step 2: Manually run T5 encoder to get encoder_outputs
+        encoder_outputs = self.model.encoder(
+            inputs_embeds=encoder_embeds,
+            attention_mask=encoder_attention_mask,
+            return_dict=True,
+        )
 
-        # Delegate to Hugging Face's generate(), which uses KV caching. We pass
-        # arguments explicitly rather than via **kwargs so that static type
-        # checking can validate them against the ``GenerationMixin`` signature.
+        # Step 3: Generate using encoder_outputs (NOT input_ids)
+        # This way, decoder uses T5's chord embedding correctly
         generated = self.model.generate(
-            input_ids=src,
+            encoder_outputs=encoder_outputs,
             attention_mask=encoder_attention_mask,
             max_new_tokens=max_len,
             eos_token_id=eos_id,
@@ -213,14 +162,11 @@ class OfflineTransformer(nn.Module):
             num_beams=1,
             use_cache=True,
             temperature=float(temperature),
-            logits_processor=logits_processors if len(logits_processors) > 0 else None,
         )
 
         # ``generated`` has shape (batch, seq_len_dec) including the initial
         # decoder start token. We drop that first token so the returned tensor
-        # contains only the generated sequence, as in the previous
-        # implementation.
-
+        # contains only the generated sequence.
         tensor_generated = cast(torch.Tensor, generated)
 
         if tensor_generated.size(1) > 0:
