@@ -20,6 +20,7 @@ from musicagent.utils.core import safe_load_state_dict, setup_logging
 from .metrics import (
     chord_length_entropy,
     chord_lengths,
+    chord_silence_counts,
     decode_tokens,
     note_in_chord_ratio,
     onset_interval_emd,
@@ -46,6 +47,9 @@ class OfflineEvalResult:
     onset_interval_emd: float = 0.0
     pred_chord_length_entropy: float = 0.0
     ref_chord_length_entropy: float = 0.0
+    chord_silence_ratio: float = 0.0
+    long_chord_ratio: float = 0.0
+    early_stop_ratio: float = 0.0
 
     # Raw data for further analysis
     per_song_nic: list[float] = field(default_factory=list)
@@ -145,6 +149,31 @@ def evaluate_offline(
     num_batches = len(test_loader)
     global_idx = 0
 
+    # Accumulators for additional metrics
+    total_silent_frames = 0
+    total_melody_frames = 0
+    total_long_chords = 0
+    total_chords = 0
+    early_stop_sequences = 0
+
+    def _ended_early(mel_ids: list[int], pred_ids: list[int]) -> bool:
+        """Return True if the chord sequence ends (EOS) before the melody."""
+        try:
+            eos_idx = pred_ids.index(d_cfg.eos_id)
+        except ValueError:
+            # Model never emitted EOS – treat as "not early".
+            return False
+
+        # Find last non-PAD frame in melody.
+        last_mel_idx = len(mel_ids) - 1
+        while last_mel_idx >= 0 and mel_ids[last_mel_idx] == d_cfg.pad_id:
+            last_mel_idx -= 1
+
+        # If melody is degenerate or EOS is at/after melody end, not early.
+        if last_mel_idx <= 0:
+            return False
+        return eos_idx < last_mel_idx
+
     with torch.no_grad():
         for batch_idx, (src, tgt) in enumerate(test_loader):
             src = src.to(device)
@@ -179,8 +208,24 @@ def evaluate_offline(
                 result.ref_intervals.extend(onset_intervals(mel_tokens, ref_tokens))
 
                 # Chord lengths
-                result.pred_lengths.extend(chord_lengths(pred_tokens))
-                result.ref_lengths.extend(chord_lengths(ref_tokens))
+                lengths_pred = chord_lengths(pred_tokens)
+                lengths_ref = chord_lengths(ref_tokens)
+                result.pred_lengths.extend(lengths_pred)
+                result.ref_lengths.extend(lengths_ref)
+
+                # Chord silence ratio (predicted chords only)
+                silent, total = chord_silence_counts(mel_tokens, pred_tokens)
+                total_silent_frames += silent
+                total_melody_frames += total
+
+                # Long chords ratio (predicted chords only, >32 frames)
+                long_threshold = 32
+                total_long_chords += sum(1 for length in lengths_pred if length > long_threshold)
+                total_chords += len(lengths_pred)
+
+                # Early stop ratio (EOS before melody end)
+                if _ended_early(mel_ids, pred_ids):
+                    early_stop_sequences += 1
 
                 global_idx += 1
 
@@ -194,6 +239,17 @@ def evaluate_offline(
     result.pred_chord_length_entropy = chord_length_entropy(result.pred_lengths)
     result.ref_chord_length_entropy = chord_length_entropy(result.ref_lengths)
     result.num_sequences = len(result.per_song_nic)
+
+    # Aggregate additional diagnostics
+    result.chord_silence_ratio = (
+        (total_silent_frames / total_melody_frames) * 100.0 if total_melody_frames > 0 else 0.0
+    )
+    result.long_chord_ratio = (
+        (total_long_chords / total_chords) * 100.0 if total_chords > 0 else 0.0
+    )
+    result.early_stop_ratio = (
+        (early_stop_sequences / result.num_sequences) * 100.0 if result.num_sequences > 0 else 0.0
+    )
 
     return result
 

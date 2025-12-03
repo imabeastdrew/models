@@ -47,11 +47,9 @@ __all__ = [
 
 
 def main() -> None:
-    """Unified entry point for evaluation (online or offline mode).
+    """Entry point for eval
 
-    Examples
-    --------
-    .. code-block:: bash
+    Ex:
 
         musicagent-eval --mode offline --checkpoint checkpoints/offline/best_model.pt
         musicagent-eval --mode online --checkpoint checkpoints/online/best_model.pt
@@ -69,7 +67,9 @@ def main() -> None:
     # Put remaining args back for the sub-command
     sys.argv = [sys.argv[0]] + remaining
 
-    if args.mode == "online":
+    if args.mode == "offline":
+        offline_main()
+    elif args.mode == "online":
         online_main()
     else:
-        offline_main()
+        raise ValueError("Invalid mode: 'eval' must be either 'online' or 'offline'")

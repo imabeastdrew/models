@@ -78,9 +78,7 @@ class OfflineDataset(BaseDataset):
                 chord_frames = chord_frames[start : start + max_frames]
 
             # On-the-fly random transposition in [-max_transpose, max_transpose].
-            semitones = random.randint(
-                -self.config.max_transpose, self.config.max_transpose
-            )
+            semitones = random.randint(-self.config.max_transpose, self.config.max_transpose)
             melody_frames = self._transpose_melody(melody_frames, semitones)
             chord_frames = self._transpose_chord(chord_frames, semitones)
         else:
@@ -89,12 +87,8 @@ class OfflineDataset(BaseDataset):
             chord_frames = chord_frames[:max_frames]
 
         # Re-add SOS and EOS to ensure proper sequence structure
-        src_seq = np.concatenate(
-            [[self.config.sos_id], melody_frames, [self.config.eos_id]]
-        )
-        tgt_seq = np.concatenate(
-            [[self.config.sos_id], chord_frames, [self.config.eos_id]]
-        )
+        src_seq = np.concatenate([[self.config.sos_id], melody_frames, [self.config.eos_id]])
+        tgt_seq = np.concatenate([[self.config.sos_id], chord_frames, [self.config.eos_id]])
 
         return {
             "src": torch.tensor(src_seq, dtype=torch.long),

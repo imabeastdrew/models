@@ -182,7 +182,7 @@ def histogram(values: Sequence[int], max_bin: int = 16) -> np.ndarray:
 
 
 def earth_movers_distance(hist_a: np.ndarray, hist_b: np.ndarray) -> float:
-    """1D Earth Mover's Distance between two histograms."""
+    """EMD between two histograms."""
     cdf_a = np.cumsum(hist_a)
     cdf_b = np.cumsum(hist_b)
     return float(np.sum(np.abs(cdf_a - cdf_b)))
@@ -200,7 +200,7 @@ def onset_interval_emd(
 
 
 # ---------------------------------------------------------------------------
-# Metric 3: Chord Length Entropy
+# Metric 3: Chord Length / Silence / Early-Stop helpers
 # ---------------------------------------------------------------------------
 
 
@@ -232,6 +232,58 @@ def chord_lengths(chord_tokens: Sequence[str]) -> list[int]:
         lengths.append(current_len)
 
     return lengths
+
+
+def chord_silence_counts(
+    melody_tokens: Sequence[str],
+    chord_tokens: Sequence[str],
+) -> tuple[int, int]:
+    """Count frames where melody is sounding but the chord is silent/special.
+
+    A "melody frame" is any frame where :func:`parse_melody_token` returns a
+    valid MIDI pitch (i.e., not rest/pad/eos). A "silent chord" is any frame
+    where :func:`parse_chord_token` returns ``(None, None)``.
+
+    Returns
+    -------
+    silent_frames: int
+        Number of frames with non-silent melody and silent chord.
+    total_melody_frames: int
+        Total number of frames with non-silent melody.
+    """
+    silent = 0
+    total = 0
+
+    for mel_tok, chd_tok in zip(melody_tokens, chord_tokens):
+        midi_pitch = parse_melody_token(mel_tok)
+        if midi_pitch is None:
+            # No active melody in this frame – ignored for the denominator.
+            continue
+
+        total += 1
+        root, quality = parse_chord_token(chd_tok)
+        if root is None or quality is None:
+            silent += 1
+
+    return silent, total
+
+
+def chord_silence_ratio(
+    melody_tokens: Sequence[str],
+    chord_tokens: Sequence[str],
+) -> float:
+    """Fraction of frames with non-silent melody but silent chords.
+
+    This mirrors the "chord silence ratio" statistic in ReaLchords' Table 3,
+    where silence is measured relative to frames with a sounding melody.
+    """
+    silent, total = chord_silence_counts(melody_tokens, chord_tokens)
+    return silent / total if total > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Metric 4: Chord Length Entropy
+# ---------------------------------------------------------------------------
 
 
 def chord_length_entropy(lengths: Sequence[int], max_bin: int = 32) -> float:
