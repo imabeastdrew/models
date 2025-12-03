@@ -87,34 +87,33 @@ def process_dataset(config: DataConfig) -> None:
     # ------------------------------------------------------------------
     # Pass 1: Build Vocabulary
     # ------------------------------------------------------------------
-    logger.info("Pass 1: Building Vocabulary...")
+    logger.info("Pass 1: Building Vocabulary (no transposition)...")
     with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Building Vocab"):
             annot = data.get("annotations", {})
 
-            # Augment vocab by all transpositions in [-max_transpose, max_transpose].
-            for transpose in range(-config.max_transpose, config.max_transpose + 1):
-                if annot.get("melody"):
-                    for n in annot["melody"]:
-                        pitch = n["pitch_class"] + (n["octave"] * 12) + config.center_midi
-                        tp_pitch = get_transposed_pitch(pitch, transpose)
-                        melody_vocab.add(f"pitch_{tp_pitch}_on")
-                        melody_vocab.add(f"pitch_{tp_pitch}_hold")
+            # Build vocab strictly from the observed dataset (no transposition).
+            if annot.get("melody"):
+                for n in annot["melody"]:
+                    pitch = n["pitch_class"] + (n["octave"] * 12) + config.center_midi
+                    tp_pitch = get_transposed_pitch(pitch, 0)
+                    melody_vocab.add(f"pitch_{tp_pitch}_on")
+                    melody_vocab.add(f"pitch_{tp_pitch}_hold")
 
-                if annot.get("harmony"):
-                    for c in annot["harmony"]:
-                        # Some annotations may have empty or missing interval lists.
-                        # These would produce an empty chord "quality" string, which
-                        # later cannot be parsed by the evaluation metrics.
-                        intervals = c.get("root_position_intervals") or []
-                        if not intervals:
-                            # Treat these as "no chord" and skip them in the vocab.
-                            continue
+            if annot.get("harmony"):
+                for c in annot["harmony"]:
+                    # Some annotations may have empty or missing interval lists.
+                    # These would produce an empty chord "quality" string, which
+                    # later cannot be parsed by the evaluation metrics.
+                    intervals = c.get("root_position_intervals") or []
+                    if not intervals:
+                        # Treat these as "no chord" and skip them in the vocab.
+                        continue
 
-                        tp_root = (c["root_pitch_class"] + transpose) % 12
-                        token = chord_mapper.get_token(tp_root, intervals, c["inversion"])
-                        chord_vocab.add(f"{token}_on")
-                        chord_vocab.add(f"{token}_hold")
+                    tp_root = (c["root_pitch_class"] + 0) % 12
+                    token = chord_mapper.get_token(tp_root, intervals, c["inversion"])
+                    chord_vocab.add(f"{token}_on")
+                    chord_vocab.add(f"{token}_hold")
 
     # Save separate melody and chord vocabularies for models that use
     # separate embedding tables. From this point on, all sequences on disk

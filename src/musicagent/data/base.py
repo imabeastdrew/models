@@ -82,9 +82,14 @@ class BaseDataset(Dataset, ABC):
         self.vocab_melody: dict[str, int] = dict(self.melody_token_to_id)
         self.vocab_chord: dict[str, int] = dict(self.chord_token_to_id)
 
-        # Precompute the set of chord vocab IDs for fast membership checks in
-        # transposition helpers.
-        self._chord_vocab_ids: set[int] = set(self.vocab_chord.values())
+        # Precompute the set of chord vocab IDs (excluding specials) for fast
+        # membership checks in transposition helpers. We treat only tokens that
+        # end with ``_on`` / ``_hold`` as actual chord symbols.
+        self._chord_vocab_ids: set[int] = {
+            idx
+            for tok, idx in self.vocab_chord.items()
+            if tok.endswith("_on") or tok.endswith("_hold")
+        }
 
         self._build_transposition_tables()
 
