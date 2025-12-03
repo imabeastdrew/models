@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help sync lint format fmt typecheck test check all
+.PHONY: help sync lint format fmt typecheck test check all data
 
 help:
 	@echo "Available targets:"
@@ -11,6 +11,7 @@ help:
 	@echo "  test       - Run pytest test suite"
 	@echo "  check      - Run lint, typecheck, and test"
 	@echo "  all        - Run sync, format, and full check pipeline"
+	@echo "  data       - Run preprocessing to build numpy datasets"
 
 sync:
 	uv sync --dev
@@ -30,5 +31,8 @@ test:
 check: lint typecheck test
 
 all: sync format check
+
+data:
+	uv run python -m musicagent.scripts.preprocess
 
 
