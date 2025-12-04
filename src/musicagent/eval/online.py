@@ -391,6 +391,17 @@ def main():
     from musicagent.utils import load_configs_from_dir
 
     parser = build_eval_online_parser()
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=0,
+        help="Number of predicted sequences to print with ground truth.",
+    )
+    parser.add_argument(
+        "--all-metrics",
+        action="store_true",
+        help="Print all metrics including diagnostics.",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -453,13 +464,34 @@ def main():
     logger.info(f"Test Loss:                 {result.test_loss:.4f}")
     logger.info(f"Test Perplexity:           {result.test_perplexity:.2f}")
     logger.info("-" * 60)
-    logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}%")
+    logger.info(
+        f"NiC Ratio:                 {result.nic_ratio * 100:.2f}% (±{result.nic_std * 100:.2f}%)"
+    )
     logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
     logger.info(
         f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  "
         f"(ref: {result.ref_chord_length_entropy:.2f})"
     )
+    if args.all_metrics:
+        logger.info("-" * 60)
+        logger.info(f"Chord Silence Ratio:       {result.chord_silence_ratio:.2f}%")
+        logger.info(f"Long Chord Ratio (>32f):   {result.long_chord_ratio:.2f}%")
+        logger.info(f"Early Stop Ratio:          {result.early_stop_ratio:.2f}%")
     logger.info("=" * 60)
+
+    if args.num_samples > 0:
+        logger.info("\n" + "=" * 60)
+        logger.info(f"Sample Predictions ({args.num_samples} sequences)")
+        logger.info("=" * 60)
+
+        num_to_show = min(args.num_samples, len(result.cached_predictions))
+        for idx in range(num_to_show):
+            if idx in result.cached_predictions:
+                mel_tokens, pred_tokens, ref_tokens = result.cached_predictions[idx]
+                logger.info(f"\n--- Sequence {idx + 1} ---")
+                logger.info(f"Melody:   {' '.join(mel_tokens)}")
+                logger.info(f"Predicted: {' '.join(pred_tokens)}")
+                logger.info(f"Ground Truth: {' '.join(ref_tokens)}")
 
 
 if __name__ == "__main__":
