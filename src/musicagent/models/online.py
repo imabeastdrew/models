@@ -1,4 +1,4 @@
-"""Online transformer.
+"""Online transformer using T5 decoder stack.
 
 The online model generates chords without seeing the current or future melody.
 It is trained on interleaved sequences of the form:
@@ -12,221 +12,34 @@ modality, selected via the is_melody mask.
 The model is trained as a causal language model over this sequence and, at
 inference time, we only use the chord predictions while feeding in the given
 melody tokens.
+
+This implementation uses HuggingFace's T5Stack configured as a decoder-only
+model (no encoder), providing T5-specific features:
+- T5-style feed-forward network (ReLU by default; set feed_forward_proj="gated-gelu"
+  in T5Config for gated variant used in T5 1.1)
+- T5-style layer normalization (pre-norm architecture)
+- T5 relative position bias
+- T5 weight initialization
 """
 
-import math
+from __future__ import annotations
+
 from typing import cast
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+from transformers import T5Config
+from transformers.models.t5.modeling_t5 import T5Stack
 
 from musicagent.config import DataConfig, OnlineConfig
 
 
-class RMSNorm(nn.Module):
-    """Root-mean-square LayerNorm without mean subtraction."""
-
-    def __init__(self, d_model: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., d_model)
-        norm = x.pow(2).mean(dim=-1, keepdim=True)
-        return self.weight * x * torch.rsqrt(norm + self.eps)
-
-
-class RelativePositionBias(nn.Module):
-    """Relative position bias for self-attention."""
-
-    def __init__(self, num_buckets: int, max_distance: int, num_heads: int):
-        super().__init__()
-        self.num_buckets = num_buckets
-        self.max_distance = max_distance
-        self.num_heads = num_heads
-        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads)
-
-    def _relative_position_bucket(self, relative_position: torch.Tensor) -> torch.Tensor:
-        """Translate relative position to a bucket number (T5-style)."""
-        num_buckets = self.num_buckets
-        max_distance = self.max_distance
-        n = -relative_position
-        n = torch.abs(n)
-
-        max_exact = num_buckets // 2
-        is_small = n < max_exact
-        val_if_large = max_exact + (
-            (
-                (torch.log(n.float() / max_exact) / math.log(max_distance / max_exact))
-                * (num_buckets - max_exact)
-            ).to(torch.long)
-        )
-        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
-        # torch.where is typed as returning Any in some torch stubs; cast for mypy.
-        ret = torch.where(is_small, n, val_if_large)
-        return cast(torch.Tensor, ret)
-
-    def forward(
-        self, seq_len: int, device: torch.device, past_key_values_length: int = 0
-    ) -> torch.Tensor:
-        """Return bias tensor of shape (1, num_heads, seq_len, seq_len + past_key_values_length)."""
-        total_len = seq_len + past_key_values_length
-        context_position = torch.arange(
-            past_key_values_length, total_len, dtype=torch.long, device=device
-        )[:, None]
-        memory_position = torch.arange(total_len, dtype=torch.long, device=device)[None, :]
-        relative_position = memory_position - context_position  # (S, S)
-        rp_bucket = self._relative_position_bucket(relative_position)
-        # (S, S, H)
-        values = self.relative_attention_bias(rp_bucket)
-        # (1, H, S, S)
-        bias = values.permute(2, 0, 1).unsqueeze(0)
-        return cast(torch.Tensor, bias)
-
-
-class SelfAttentionWithRelPos(nn.Module):
-    """Multi-head self-attention with relative position bias and causal mask."""
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        dropout: float,
-        rel_pos_bias: RelativePositionBias,
-    ):
-        super().__init__()
-        if d_model % n_heads != 0:
-            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
-
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.rel_pos_bias = rel_pos_bias
-
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        causal_mask: torch.Tensor | None,
-        padding_mask: torch.Tensor | None,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        """
-        Args:
-            x: (batch, seq_len, d_model)
-            causal_mask: (seq_len, seq_len + past_len) bool, True where masked
-            padding_mask: (batch, seq_len + past_len) bool, True for PAD tokens
-            past_key_value: Tuple of (key, value) tensors from previous step
-            use_cache: Whether to return new key/value states
-        """
-        bsz, seq_len, _ = x.size()
-        device = x.device
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # (batch, n_heads, seq_len, head_dim)
-        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-
-        past_len = 0
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            past_len = past_k.size(2)
-            k = torch.cat([past_k, k], dim=2)
-            v = torch.cat([past_v, v], dim=2)
-
-        current_key_value = (k, v) if use_cache else None
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Relative position bias: (1, n_heads, seq_len, seq_len + past_len)
-        rel_bias = self.rel_pos_bias(seq_len, device, past_key_values_length=past_len)
-        attn_scores = attn_scores + rel_bias
-
-        # Causal mask
-        if causal_mask is not None:
-            attn_scores = attn_scores.masked_fill(
-                causal_mask.to(device=device)[None, None, :, :], float("-inf")
-            )
-
-        # Key padding mask
-        if padding_mask is not None:
-            attn_scores = attn_scores.masked_fill(padding_mask[:, None, None, :], float("-inf"))
-
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        attn_output = torch.matmul(attn_weights, v)  # (batch, n_heads, seq_len, head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
-
-        return self.o_proj(attn_output), current_key_value
-
-
-class DecoderBlock(nn.Module):
-    """Single decoder block with self-attention and feed-forward network."""
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        dropout: float,
-        rel_pos_bias: RelativePositionBias,
-    ):
-        super().__init__()
-        self.self_attn = SelfAttentionWithRelPos(d_model, n_heads, dropout, rel_pos_bias)
-        self.norm1 = RMSNorm(d_model)
-        self.norm2 = RMSNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-        d_ff = d_model * 4
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_ff, d_model),
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        causal_mask: torch.Tensor | None,
-        padding_mask: torch.Tensor | None,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
-        use_cache: bool = False,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
-        # Self-attention block
-        h, present_kv = self.self_attn(
-            self.norm1(x),
-            causal_mask,
-            padding_mask,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
-        x = x + self.dropout(h)
-
-        # Feed-forward block
-        h = self.ff(self.norm2(x))
-        x = x + self.dropout(h)
-        return x, present_kv
-
-
 class OnlineTransformer(nn.Module):
-    """Causal transformer over interleaved melody/chord tokens with separate embeddings.
+    """T5-based causal transformer over interleaved melody/chord tokens.
 
     Architecture:
     - Separate embedding layers for melody and chord vocabularies
-    - Stack of transformer *encoder* layers with a causal self-attention mask
+    - T5Stack configured as decoder-only (causal self-attention)
     - Output projection to chord vocabulary only
 
     Training input format (from OnlineDataset):
@@ -255,8 +68,6 @@ class OnlineTransformer(nn.Module):
         self.chord_vocab_size = chord_vocab_size
         self.d_model = model_config.d_model
         self.pad_id = data_config.pad_id
-        # Gradient checkpointing flag (applied to decoder blocks in training).
-        self.gradient_checkpointing: bool = False
 
         # Separate embeddings for melody and chord tokens
         self.melody_embed = nn.Embedding(
@@ -270,93 +81,51 @@ class OnlineTransformer(nn.Module):
             padding_idx=data_config.pad_id,
         )
 
-        # Relative position bias shared across all decoder layers. The maximum
-        # sequence length seen during training is 1 + 2 * max_len.
-        self.rel_pos_bias = RelativePositionBias(
-            num_buckets=32,
-            max_distance=128,
+        # Configure T5Stack as decoder-only (no encoder)
+        # Using is_decoder=True enables causal attention mask
+        # Using is_encoder_decoder=False removes cross-attention layers
+        t5_config = T5Config(
+            vocab_size=chord_vocab_size,  # Not used directly since we provide inputs_embeds
+            d_model=model_config.d_model,
+            d_kv=model_config.d_model // model_config.n_heads,
+            d_ff=model_config.d_model * 4,
             num_heads=model_config.n_heads,
+            num_layers=model_config.n_layers,
+            dropout_rate=model_config.dropout,
+            is_decoder=True,
+            is_encoder_decoder=False,  # Decoder-only mode (no cross-attention)
+            use_cache=True,
+            pad_token_id=data_config.pad_id,
         )
 
-        # Stack of decoder blocks
-        self.layers = nn.ModuleList(
-            [
-                DecoderBlock(
-                    d_model=model_config.d_model,
-                    n_heads=model_config.n_heads,
-                    dropout=model_config.dropout,
-                    rel_pos_bias=self.rel_pos_bias,
-                )
-                for _ in range(model_config.n_layers)
-            ]
-        )
+        # T5Stack requires an embed_tokens argument, but we use inputs_embeds
+        # in forward(), so we create a dummy embedding that won't be used.
+        # This is similar to how the offline model handles encoder embeddings.
+        self._dummy_embed = nn.Embedding(1, model_config.d_model)
+        self.decoder = T5Stack(t5_config, embed_tokens=self._dummy_embed)
 
-        # Final normalization and projection to chord vocabulary only
-        self.final_norm = RMSNorm(model_config.d_model)
-        self.fc_out = nn.Linear(model_config.d_model, chord_vocab_size)
+        # Output projection to chord vocabulary only
+        self.fc_out = nn.Linear(model_config.d_model, chord_vocab_size, bias=False)
 
-    def _create_causal_mask(
-        self, seq_len: int, device: torch.device, past_len: int = 0
-    ) -> torch.Tensor:
-        """Create causal attention mask.
-
-        Args:
-            seq_len: Sequence length
-            device: Device to create tensor on
-            past_len: Length of past key values
-
-        Returns:
-            Boolean mask of shape (seq_len, seq_len + past_len), True where masked
-        """
-        full_len = seq_len + past_len
-        mask = torch.triu(
-            torch.ones(full_len, full_len, dtype=torch.bool, device=device),
-            diagonal=1,
-        )
-        return mask[past_len:, :]
-
-    def forward(
+    def _compute_embeddings(
         self,
         input_ids: torch.Tensor,
         is_melody: torch.Tensor,
-        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
-        use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
-        """Forward pass for training or generation.
+    ) -> torch.Tensor:
+        """Compute embeddings using separate melody/chord embedding tables.
 
         Args:
-            input_ids: Interleaved tokens (batch, seq_len). Chord positions contain
-                       chord vocab IDs, melody positions contain melody vocab IDs.
-                       Format: [SOS, y₁, x₁, y₂, x₂, ...]
-            is_melody: Boolean mask (batch, seq_len). True for melody positions,
-                       False for chord positions (including SOS).
-            past_key_values: List of tuples of (key, value) tensors from previous step.
-            use_cache: Whether to return new key/value states.
+            input_ids: Token IDs (batch, seq_len). Chord positions contain
+                      chord vocab IDs, melody positions contain melody vocab IDs.
+            is_melody: Boolean mask (batch, seq_len). True for melody positions.
 
         Returns:
-            Logits over chord vocabulary (batch, seq_len, chord_vocab_size)
-            If use_cache is True, also returns list of new (key, value) tuples.
+            Embedded tensor (batch, seq_len, d_model).
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         dtype = self.melody_embed.weight.dtype
 
-        past_len = 0
-        if past_key_values is not None:
-            past_len = past_key_values[0][0].size(2)
-
-        # Create causal mask
-        causal_mask = self._create_causal_mask(seq_len, device, past_len=past_len)
-
-        # Create padding mask
-        padding_mask = input_ids == self.pad_id
-        if past_len > 0:
-            # Assume past is not padded (valid context)
-            past_mask = torch.zeros((batch_size, past_len), dtype=torch.bool, device=device)
-            padding_mask = torch.cat([past_mask, padding_mask], dim=1)
-
-        # Embed tokens using separate embeddings based on is_melody mask.
-        # We use boolean indexing to avoid IndexError from out-of-range IDs.
         x = torch.zeros(batch_size, seq_len, self.d_model, device=device, dtype=dtype)
 
         # Embed melody positions (is_melody == True)
@@ -368,62 +137,82 @@ class OnlineTransformer(nn.Module):
         if chord_mask.any():
             x[chord_mask] = self.chord_embed(input_ids[chord_mask])
 
-        next_decoder_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
+        return x
 
-        # Apply stacked decoder blocks with causal + padding masks.
-        for i, layer in enumerate(self.layers):
-            past_kv = past_key_values[i] if past_key_values is not None else None
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        is_melody: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]]:
+        """Forward pass for training or generation.
 
-            use_checkpoint = (
-                self.gradient_checkpointing and self.training and not use_cache and past_kv is None
-            )
+        Args:
+            input_ids: Interleaved tokens (batch, seq_len). Chord positions contain
+                       chord vocab IDs, melody positions contain melody vocab IDs.
+                       Format: [SOS, y₁, x₁, y₂, x₂, ...]
+            is_melody: Boolean mask (batch, seq_len). True for melody positions,
+                       False for chord positions (including SOS).
+            attention_mask: Optional attention mask (batch, total_seq_len) where
+                           total_seq_len = past_len + seq_len. Values are 1 for valid
+                           positions, 0 for padding. If None, computed from input_ids.
+                           When using KV-cache during generation, pass the full
+                           cumulative mask to correctly handle padding in past positions.
+            past_key_values: Tuple of tuples of (key, value) tensors from previous step.
+                            Shape per layer: ((batch, n_heads, past_len, head_dim), ...).
+            use_cache: Whether to return new key/value states.
 
-            if use_checkpoint:
+        Returns:
+            Logits over chord vocabulary (batch, seq_len, chord_vocab_size).
+            If use_cache is True, also returns tuple of (key, value) tuples.
+        """
+        # Compute embeddings using separate embedding tables
+        inputs_embeds = self._compute_embeddings(input_ids, is_melody)
 
-                def _layer_forward(
-                    x_in: torch.Tensor,
-                    *,
-                    _layer=layer,
-                ) -> torch.Tensor:
-                    out, _ = _layer(
-                        x_in,
-                        causal_mask,
-                        padding_mask,
-                        past_key_value=None,
-                        use_cache=False,
-                    )
-                    from typing import cast as _cast
+        # Create attention mask if not provided
+        if attention_mask is None:
+            # Default: compute from input_ids (1 for valid, 0 for padding)
+            attention_mask = input_ids.ne(self.pad_id).to(dtype=inputs_embeds.dtype)
 
-                    return _cast(torch.Tensor, out)
-
-                x = checkpoint(_layer_forward, x, use_reentrant=False)
-                present_kv = None
-            else:
-                x, present_kv = layer(
-                    x,
-                    causal_mask,
-                    padding_mask,
-                    past_key_value=past_kv,
-                    use_cache=use_cache,
+            # If we have past key values, prepend mask for past positions
+            # NOTE: This assumes all past positions are valid. For correct handling
+            # of padding in batched generation, pass an explicit attention_mask.
+            if past_key_values is not None:
+                past_len = past_key_values[0][0].size(2)
+                past_mask = torch.ones(
+                    (attention_mask.size(0), past_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
                 )
-            if use_cache and present_kv is not None:
-                next_decoder_cache.append(present_kv)
+                attention_mask = torch.cat([past_mask, attention_mask], dim=1)
 
-        out = self.final_norm(x)
-        logits: torch.Tensor = self.fc_out(out)
+        # Forward through T5Stack decoder
+        # T5Stack with is_decoder=True automatically applies causal mask
+        outputs = self.decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            return_dict=True,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.fc_out(hidden_states)
 
         if use_cache:
-            return logits, next_decoder_cache
+            return logits, outputs.past_key_values
         return logits
 
     def enable_gradient_checkpointing(self) -> None:
-        """Enable gradient checkpointing for decoder blocks.
+        """Enable gradient checkpointing for decoder layers.
 
         This trades additional compute for reduced activation memory during
         training. It is automatically unused during generation, which runs
         under ``torch.no_grad()`` with ``use_cache=True``.
         """
-        self.gradient_checkpointing = True
+        self.decoder.gradient_checkpointing_enable()
 
     @torch.no_grad()
     def generate(
@@ -496,15 +285,27 @@ class OnlineTransformer(nn.Module):
         # SOS is a chord position
         is_melody = torch.zeros((batch_size, 1), dtype=torch.bool, device=device)
 
+        # Track cumulative attention mask to correctly handle padding in batched
+        # generation with variable-length melodies. SOS is always valid.
+        cumulative_mask = torch.ones((batch_size, 1), dtype=torch.float, device=device)
+
         generated_chords: list[torch.Tensor] = []
-        past_key_values = None
+        past_key_values: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None
 
         for t in range(melody_len):
             # Predict y_{t+1} given current context
             # Context is [SOS] for t=0, or [SOS, y₁, x₁, ..., y_t, x_t] for t>0
-            logits, past_key_values = self.forward(
-                input_ids, is_melody, past_key_values=past_key_values, use_cache=True
-            )  # (batch, seq_len, chord_vocab_size)
+            result = self.forward(
+                input_ids,
+                is_melody,
+                attention_mask=cumulative_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits, past_key_values = cast(
+                tuple[torch.Tensor, tuple[tuple[torch.Tensor, torch.Tensor], ...]],
+                result,
+            )
 
             # Get logits for next position (chord prediction)
             # Output is over chord vocab only, no masking needed
@@ -528,6 +329,13 @@ class OnlineTransformer(nn.Module):
             is_melody = torch.tensor([[False, True]], dtype=torch.bool, device=device).expand(
                 batch_size, 2
             )
+
+            # Update cumulative attention mask for next step:
+            # - Generated chord is always valid (we just generated it)
+            # - Melody token validity depends on whether it's padding
+            chord_valid = torch.ones((batch_size, 1), dtype=torch.float, device=device)
+            melody_valid = mel_token.ne(self.pad_id).unsqueeze(1).to(dtype=torch.float)
+            cumulative_mask = torch.cat([cumulative_mask, chord_valid, melody_valid], dim=1)
 
         # Stack generated chords: (batch, num_chords) in chord vocab space.
         return torch.stack(generated_chords, dim=1)
