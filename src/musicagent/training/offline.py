@@ -90,7 +90,7 @@ def train_steps(
         total_loss += loss.item()
         global_step += 1
 
-        if i % log_interval == 0 and i > 0:
+        if global_step % log_interval == 0:
             cur_loss = total_loss / log_interval
             elapsed = time.time() - start_time
             lr = scheduler.get_last_lr()[0]
