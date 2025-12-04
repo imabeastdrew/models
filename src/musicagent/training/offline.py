@@ -266,7 +266,12 @@ def train_offline(args: argparse.Namespace) -> None:
         scale_parameter=False,
         warmup_init=False,
     )
-    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
+    # Use label smoothing (as in standard T5/T5X setups) to reduce
+    # over-confidence on single tokens like EOS/REST/HOLD.
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=d_cfg.pad_id,
+        label_smoothing=0.1,
+    )
 
     # Training schedule is purely step-based: --max-steps must be provided
     # and determines when training stops.
