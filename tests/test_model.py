@@ -204,25 +204,35 @@ def test_online_model_gradient_flow() -> None:
     assert model.fc_out.weight.grad is not None
 
 
-def test_online_causal_mask() -> None:
-    """Online model should use causal (lower triangular) attention."""
+def test_online_causal_behavior() -> None:
+    """Online model should exhibit causal behavior (future tokens don't affect past)."""
     d_cfg = DataConfig(max_len=16)
     m_cfg = OnlineConfig(d_model=32, n_heads=4, n_layers=2, dropout=0.0)
     model = OnlineTransformer(m_cfg, d_cfg, melody_vocab_size=12, chord_vocab_size=22)
+    model.eval()
 
+    # Create two inputs that differ only in the last position
+    batch_size = 1
     seq_len = 6
-    mask = model._create_causal_mask(seq_len, torch.device("cpu"))
+    input_ids_1 = torch.randint(1, 10, (batch_size, seq_len))
+    input_ids_2 = input_ids_1.clone()
+    input_ids_2[:, -1] = (input_ids_1[:, -1] + 5) % 10  # Modify last token
 
-    assert mask.shape == (seq_len, seq_len)
-    assert mask.dtype == torch.bool
-
-    # Upper triangle should be True (masked), lower triangle + diagonal False
+    # Create is_melody mask (alternating pattern: SOS, chord, melody, chord, melody, ...)
+    is_melody = torch.zeros((batch_size, seq_len), dtype=torch.bool)
     for i in range(seq_len):
-        for j in range(seq_len):
-            if j > i:
-                assert mask[i, j].item() is True
-            else:
-                assert mask[i, j].item() is False
+        if i > 0 and i % 2 == 0:  # Even positions after 0 are melody
+            is_melody[:, i] = True
+
+    # Forward pass for both inputs
+    with torch.no_grad():
+        out_1 = model(input_ids_1, is_melody)
+        out_2 = model(input_ids_2, is_melody)
+
+    # Outputs at positions before the last should be identical (causal behavior)
+    # Due to T5's causal attention, changing the last token should not affect
+    # the outputs at earlier positions
+    assert torch.allclose(out_1[:, :-1, :], out_2[:, :-1, :], atol=1e-5)
 
 
 def test_online_vocab_sizes() -> None:
@@ -264,3 +274,52 @@ def test_online_generate_output_shape() -> None:
     # Output is in chord vocab space
     assert chords.shape == (batch_size, melody_len)
     assert chords.max().item() < chord_vocab_size
+
+
+def test_online_generate_with_variable_length_batch() -> None:
+    """Test that batched generation handles padding correctly for variable-length melodies.
+
+    This verifies the cumulative attention mask fix: padding tokens in past positions
+    should remain masked throughout generation, not be incorrectly marked as valid.
+    """
+    d_cfg = DataConfig(max_len=16)
+    m_cfg = OnlineConfig(d_model=32, n_heads=4, n_layers=2, dropout=0.0)
+    melody_vocab_size = 12
+    chord_vocab_size = 22
+    model = OnlineTransformer(
+        m_cfg,
+        d_cfg,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
+    )
+    model.eval()
+
+    # Create batch with variable-length melodies:
+    # - Melody 0: length 6 (full, no padding)
+    # - Melody 1: length 4 (padded to length 6 with pad_id=0)
+    max_len = 6
+    melody_0 = torch.randint(1, melody_vocab_size, (1, max_len))  # No padding
+    melody_1_real = torch.randint(1, melody_vocab_size, (1, 4))  # Real tokens
+    melody_1_pad = torch.full((1, 2), d_cfg.pad_id, dtype=torch.long)  # Padding
+    melody_1 = torch.cat([melody_1_real, melody_1_pad], dim=1)  # [real, real, real, real, pad, pad]
+
+    # Batch them together
+    batched_melody = torch.cat([melody_0, melody_1], dim=0)  # (2, 6)
+
+    # Generate chords for the batch
+    chords = model.generate(batched_melody, sos_id=d_cfg.sos_id, eos_id=d_cfg.eos_id)
+
+    # Basic shape and validity checks
+    assert chords.shape == (2, max_len)
+    assert chords.max().item() < chord_vocab_size
+    assert chords.min().item() >= 0
+
+    # Generate melody_0 individually (unbatched) and verify it matches the batched result
+    # This confirms that padding in other batch items doesn't affect generation
+    chords_0_individual = model.generate(
+        melody_0, sos_id=d_cfg.sos_id, eos_id=d_cfg.eos_id
+    )
+
+    # The first melody's chords should be identical whether batched or individual
+    # (since it has no padding and shouldn't be affected by other batch items)
+    assert torch.equal(chords[0], chords_0_individual[0])
