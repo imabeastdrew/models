@@ -251,6 +251,8 @@ def train_online(args: argparse.Namespace) -> None:
         chord_vocab_size=chord_vocab_size,
     ).to(device)
 
+    # Enable gradient checkpointing to reduce activation memory during training.
+    model.enable_gradient_checkpointing()
     total_params = count_parameters(model)
     logger.info(f"Model Parameters: {total_params:,}")
 

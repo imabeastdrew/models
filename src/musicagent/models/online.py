@@ -19,6 +19,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from musicagent.config import DataConfig, OnlineConfig
 
@@ -254,6 +255,8 @@ class OnlineTransformer(nn.Module):
         self.chord_vocab_size = chord_vocab_size
         self.d_model = model_config.d_model
         self.pad_id = data_config.pad_id
+        # Gradient checkpointing flag (applied to decoder blocks in training).
+        self.gradient_checkpointing: bool = False
 
         # Separate embeddings for melody and chord tokens
         self.melody_embed = nn.Embedding(
@@ -370,15 +373,41 @@ class OnlineTransformer(nn.Module):
         # Apply stacked decoder blocks with causal + padding masks.
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values is not None else None
-            x, present_kv = layer(
-                x,
-                causal_mask,
-                padding_mask,
-                past_key_value=past_kv,
-                use_cache=use_cache,
+
+            use_checkpoint = (
+                self.gradient_checkpointing and self.training and not use_cache and past_kv is None
             )
-            if use_cache:
-                next_decoder_cache.append(present_kv)
+
+            if use_checkpoint:
+
+                def _layer_forward(
+                    x_in: torch.Tensor,
+                    *,
+                    _layer=layer,
+                ) -> torch.Tensor:
+                    out, _ = _layer(
+                        x_in,
+                        causal_mask,
+                        padding_mask,
+                        past_key_value=None,
+                        use_cache=False,
+                    )
+                    from typing import cast as _cast
+
+                    return _cast(torch.Tensor, out)
+
+                x = checkpoint(_layer_forward, x)
+                present_kv = None
+            else:
+                x, present_kv = layer(
+                    x,
+                    causal_mask,
+                    padding_mask,
+                    past_key_value=past_kv,
+                    use_cache=use_cache,
+                )
+                if use_cache:
+                    next_decoder_cache.append(present_kv)
 
         out = self.final_norm(x)
         logits: torch.Tensor = self.fc_out(out)
@@ -386,6 +415,15 @@ class OnlineTransformer(nn.Module):
         if use_cache:
             return logits, next_decoder_cache
         return logits
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing for decoder blocks.
+
+        This trades additional compute for reduced activation memory during
+        training. It is automatically unused during generation, which runs
+        under ``torch.no_grad()`` with ``use_cache=True``.
+        """
+        self.gradient_checkpointing = True
 
     @torch.no_grad()
     def generate(
