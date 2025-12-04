@@ -17,9 +17,9 @@ class DataConfig:
     # Constants
     frame_rate: int = 4  # 16th notes
     center_midi: int = 60
-    max_len: int = 256 
+    max_len: int = 256
     storage_len: int = 1024  # For random cropping
-    max_transpose: int = 6  # For augmentation 
+    max_transpose: int = 6  # For augmentation
 
     # Tokens
     pad_token: str = "<pad>"

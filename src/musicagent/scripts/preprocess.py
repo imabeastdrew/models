@@ -5,15 +5,13 @@ HookTheory dataset into numpy arrays and vocabularies used by the
 offline and online models, and exposes a CLI entry point.
 """
 
-from typing import Any
-
-
 from __future__ import annotations
 
 import json
 import logging
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Any
 
 import ijson
 import numpy as np
@@ -37,7 +35,7 @@ class Vocabulary:
         }
         self.id_to_token: dict[int, str] = {v: k for k, v in self.token_to_id.items()}
         self.next_id = max(self.token_to_id.values()) + 1
-        self.counts: Counter = Counter[Any]()
+        self.counts: Counter[str] = Counter()
 
     def add(self, token: str) -> None:
         self.counts[token] += 1
@@ -52,7 +50,10 @@ class Vocabulary:
     def save(self, path: Path) -> None:
         with open(path, "w") as f:
             json.dump(
-                {"token_to_id": self.token_to_id, "counts": dict[Any, int](self.counts.most_common())},
+                {
+                    "token_to_id": self.token_to_id,
+                    "counts": dict[Any, int](self.counts.most_common()),
+                },
                 f,
                 indent=2,
             )
@@ -64,7 +65,7 @@ class ChordMapper:
         self.root_names = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
     def get_token(self, root_pc: int, intervals: list[int], inversion: int) -> str:
-        quality = "-".join(map[str, int](str, intervals))
+        quality = "-".join(map(str, intervals))
         root = self.root_names[root_pc % 12]
         return f"{root}:{quality}/{inversion}"
 
@@ -108,7 +109,7 @@ def process_dataset(config: DataConfig) -> None:
                     # These produce empty chord qualities, which
                     # cannot be parsed by the evaluation metrics.
                     intervals = c.get("root_position_intervals") or []
-                    if not intervals: 
+                    if not intervals:
                         # Treat these as no chord and skip.
                         continue
 
@@ -132,7 +133,7 @@ def process_dataset(config: DataConfig) -> None:
 
     buffers: defaultdict[str, dict[str, list[np.ndarray]]] = defaultdict(_buffer_factory)
 
-    with open(config.data_raw, "rb") as f:  
+    with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Tokenizing"):
             split = data.get("split", "TRAIN").lower()
             annot = data.get("annotations", {})
@@ -245,5 +246,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-
     main()

@@ -368,7 +368,7 @@ class OnlineTransformer(nn.Module):
         if chord_mask.any():
             x[chord_mask] = self.chord_embed(input_ids[chord_mask])
 
-        next_decoder_cache = []
+        next_decoder_cache: list[tuple[torch.Tensor, torch.Tensor]] = []
 
         # Apply stacked decoder blocks with causal + padding masks.
         for i, layer in enumerate(self.layers):
@@ -405,8 +405,8 @@ class OnlineTransformer(nn.Module):
                     padding_mask,
                     past_key_value=past_kv,
                     use_cache=use_cache,
-            )
-            if use_cache:
+                )
+            if use_cache and present_kv is not None:
                 next_decoder_cache.append(present_kv)
 
         out = self.final_norm(x)

@@ -335,27 +335,29 @@ def main():
     logger.info(f"Test Loss:                 {result.test_loss:.4f}")
     logger.info(f"Test Perplexity:           {result.test_perplexity:.2f}")
     logger.info("-" * 60)
-    logger.info(f"NiC Ratio:                 {result.nic_ratio * 100:.2f}% (±{result.nic_std * 100:.2f}%)")
+    logger.info(
+        f"NiC Ratio:                 {result.nic_ratio * 100:.2f}% (±{result.nic_std * 100:.2f}%)"
+    )
     logger.info(f"Onset Interval EMD:        {result.onset_interval_emd * 1e3:.2f} ×10⁻³")
     logger.info(
         f"Chord Length Entropy:      {result.pred_chord_length_entropy:.2f}  "
         f"(ref: {result.ref_chord_length_entropy:.2f})"
     )
-    
+
     if args.all_metrics:
         logger.info("-" * 60)
         logger.info(f"Chord Silence Ratio:       {result.chord_silence_ratio:.2f}%")
         logger.info(f"Long Chord Ratio (>32f):   {result.long_chord_ratio:.2f}%")
         logger.info(f"Early Stop Ratio:          {result.early_stop_ratio:.2f}%")
-    
+
     logger.info("=" * 60)
-    
+
     # Print sample predictions if requested
     if args.num_samples > 0:
         logger.info("\n" + "=" * 60)
         logger.info(f"Sample Predictions ({args.num_samples} sequences)")
         logger.info("=" * 60)
-        
+
         num_to_show = min(args.num_samples, len(result.cached_predictions))
         for idx in range(num_to_show):
             if idx in result.cached_predictions:

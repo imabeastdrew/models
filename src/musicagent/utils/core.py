@@ -31,8 +31,8 @@ def seed_everything(
     Args:
         seed: Base random seed.
         deterministic: If True, enables deterministic algorithms in PyTorch/CuDNN
-            
-        extra_info: Optional dict to log alongside the seed settings.   
+
+        extra_info: Optional dict to log alongside the seed settings.
     """
     logging.getLogger(__name__).info(
         "Seeding experiment",
