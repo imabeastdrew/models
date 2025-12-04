@@ -396,7 +396,7 @@ class OnlineTransformer(nn.Module):
 
                     return _cast(torch.Tensor, out)
 
-                x = checkpoint(_layer_forward, x)
+                x = checkpoint(_layer_forward, x, use_reentrant=False)
                 present_kv = None
             else:
                 x, present_kv = layer(
@@ -405,9 +405,9 @@ class OnlineTransformer(nn.Module):
                     padding_mask,
                     past_key_value=past_kv,
                     use_cache=use_cache,
-                )
-                if use_cache:
-                    next_decoder_cache.append(present_kv)
+            )
+            if use_cache:
+                next_decoder_cache.append(present_kv)
 
         out = self.final_norm(x)
         logits: torch.Tensor = self.fc_out(out)

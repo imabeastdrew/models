@@ -5,6 +5,9 @@ HookTheory dataset into numpy arrays and vocabularies used by the
 offline and online models, and exposes a CLI entry point.
 """
 
+from typing import Any
+
+
 from __future__ import annotations
 
 import json
@@ -34,7 +37,7 @@ class Vocabulary:
         }
         self.id_to_token: dict[int, str] = {v: k for k, v in self.token_to_id.items()}
         self.next_id = max(self.token_to_id.values()) + 1
-        self.counts: Counter = Counter()
+        self.counts: Counter = Counter[Any]()
 
     def add(self, token: str) -> None:
         self.counts[token] += 1
@@ -49,7 +52,7 @@ class Vocabulary:
     def save(self, path: Path) -> None:
         with open(path, "w") as f:
             json.dump(
-                {"token_to_id": self.token_to_id, "counts": dict(self.counts.most_common())},
+                {"token_to_id": self.token_to_id, "counts": dict[Any, int](self.counts.most_common())},
                 f,
                 indent=2,
             )
@@ -61,7 +64,7 @@ class ChordMapper:
         self.root_names = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
     def get_token(self, root_pc: int, intervals: list[int], inversion: int) -> str:
-        quality = "-".join(map(str, intervals))
+        quality = "-".join(map[str, int](str, intervals))
         root = self.root_names[root_pc % 12]
         return f"{root}:{quality}/{inversion}"
 
@@ -72,7 +75,7 @@ def get_transposed_pitch(pitch: int, semitones: int) -> int:
 
 
 def process_dataset(config: DataConfig) -> None:
-    """Run the full preprocessing pipeline given a :class:`DataConfig`."""
+    """Run preprocessing, given a `DataConfig`."""
 
     if not config.data_raw.exists():
         raise FileNotFoundError(f"{config.data_raw} does not exist")
@@ -87,12 +90,11 @@ def process_dataset(config: DataConfig) -> None:
     # ------------------------------------------------------------------
     # Pass 1: Build Vocabulary
     # ------------------------------------------------------------------
-    logger.info("Pass 1: Building Vocabulary (no transposition)...")
+    logger.info("Building...")
     with open(config.data_raw, "rb") as f:
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Building Vocab"):
             annot = data.get("annotations", {})
 
-            # Build vocab strictly from the observed dataset (no transposition).
             if annot.get("melody"):
                 for n in annot["melody"]:
                     pitch = n["pitch_class"] + (n["octave"] * 12) + config.center_midi
@@ -102,12 +104,12 @@ def process_dataset(config: DataConfig) -> None:
 
             if annot.get("harmony"):
                 for c in annot["harmony"]:
-                    # Some annotations may have empty or missing interval lists.
-                    # These would produce an empty chord "quality" string, which
-                    # later cannot be parsed by the evaluation metrics.
+                    # Some annotations have empty or missing interval lists.
+                    # These produce empty chord qualities, which
+                    # cannot be parsed by the evaluation metrics.
                     intervals = c.get("root_position_intervals") or []
-                    if not intervals:
-                        # Treat these as "no chord" and skip them in the vocab.
+                    if not intervals: 
+                        # Treat these as no chord and skip.
                         continue
 
                     tp_root = (c["root_pitch_class"] + 0) % 12
@@ -115,29 +117,22 @@ def process_dataset(config: DataConfig) -> None:
                     chord_vocab.add(f"{token}_on")
                     chord_vocab.add(f"{token}_hold")
 
-    # Save separate melody and chord vocabularies for models that use
-    # separate embedding tables. From this point on, all sequences on disk
-    # are stored directly in their native ID spaces:
-    #
-    #   - ``*_src.npy`` contains melody vocab IDs.
-    #   - ``*_tgt.npy`` contains chord vocab IDs.
-    #
-    # The offline and online datasets perform all transposition and decoding
-    # strictly within these separate vocabularies.
+    # Save vocabularies. From this point on, all sequences on disk
+    # are stored directly in their native ID spaces.
     melody_vocab.save(config.vocab_melody)
     chord_vocab.save(config.vocab_chord)
 
     # ------------------------------------------------------------------
-    # Pass 2: Tokenize and save to NPY (separate vocab IDs)
+    # Tokenizing & Numpy
     # ------------------------------------------------------------------
-    logger.info("Pass 2: Tokenizing to Numpy (separate melody/chord IDs)...")
+    logger.info("Tokenizing..")
 
     def _buffer_factory() -> dict[str, list[np.ndarray]]:
         return {"src": [], "tgt": []}
 
     buffers: defaultdict[str, dict[str, list[np.ndarray]]] = defaultdict(_buffer_factory)
 
-    with open(config.data_raw, "rb") as f:
+    with open(config.data_raw, "rb") as f:  
         for _, data in tqdm(ijson.kvitems(f, ""), desc="Tokenizing"):
             split = data.get("split", "TRAIN").lower()
             annot = data.get("annotations", {})
@@ -147,12 +142,10 @@ def process_dataset(config: DataConfig) -> None:
 
             total_frames = int(num_beats * config.frame_rate)
 
-            # Random transposition in [-max_transpose, max_transpose] is applied
-            # on-the-fly in the Dataset for the train split.
             transpose = 0
 
             arr_len = config.storage_len
-            # Default to silence (rest) for all frames; padding is applied after EOS.
+            # Default to silence for all frames; padding is applied after EOS.
             m_row = np.full(arr_len, config.rest_id, dtype=np.int32)
             c_row = np.full(arr_len, config.rest_id, dtype=np.int32)
 
@@ -211,7 +204,7 @@ def process_dataset(config: DataConfig) -> None:
             eos_idx = min(total_frames + 1, arr_len - 1)
             m_row[eos_idx] = config.eos_id
             c_row[eos_idx] = config.eos_id
-            # Everything after EOS is padding, not silence.
+            # Pad remaining frames.
             if eos_idx + 1 < arr_len:
                 m_row[eos_idx + 1 :] = config.pad_id
                 c_row[eos_idx + 1 :] = config.pad_id
@@ -219,7 +212,7 @@ def process_dataset(config: DataConfig) -> None:
             buffers[split]["src"].append(m_row)
             buffers[split]["tgt"].append(c_row)
 
-    # Save buffers to disk
+    # Save buffers
     for split, data in buffers.items():
         if not data["src"]:
             continue
@@ -230,16 +223,14 @@ def process_dataset(config: DataConfig) -> None:
         out_src = config.data_processed / f"{split}_src.npy"
         out_tgt = config.data_processed / f"{split}_tgt.npy"
 
-        logger.info(f"Saving {split} src: {src_arr.shape} to {out_src}")
         np.save(out_src, src_arr)
-        logger.info(f"Saving {split} tgt: {tgt_arr.shape} to {out_tgt}")
         np.save(out_tgt, tgt_arr)
 
-    logger.info("Preprocessing complete.")
+    logger.info("Done.")
 
 
 def main() -> None:
-    """Run preprocessing from the command line."""
+    """CLI."""
 
     parser = build_preprocess_parser()
     args = parser.parse_args()
@@ -254,6 +245,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Allow running as a module for local development:
-    #   python -m musicagent.scripts.preprocess ...
+
     main()

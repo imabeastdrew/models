@@ -16,15 +16,14 @@ def load_configs_from_dir(
 ) -> tuple[DataConfig, ModelConfigT]:
     """Load DataConfig and model config from a directory containing JSON files.
 
-    This is useful for loading configs saved alongside model checkpoints,
-    ensuring evaluation uses the same settings as training.
+    Useful for loading configs saved alongside checkpoints.
 
     Args:
         cfg_dir: Directory containing data_config.json and model_config.json
-        model_config_class: The model config class to instantiate (OnlineConfig or OfflineConfig)
+        model_config_class: Class for OnlineConfig or OfflineConfig
 
     Returns:
-        Tuple of (DataConfig, model_config)
+        DataConfig and model config
     """
     data_cfg_path = cfg_dir / "data_config.json"
     model_cfg_path = cfg_dir / "model_config.json"

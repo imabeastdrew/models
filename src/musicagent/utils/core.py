@@ -31,8 +31,8 @@ def seed_everything(
     Args:
         seed: Base random seed.
         deterministic: If True, enables deterministic algorithms in PyTorch/CuDNN
-            (can be slower and may raise warnings if some ops are non-deterministic).
-        extra_info: Optional dict to log alongside the seed settings.
+            
+        extra_info: Optional dict to log alongside the seed settings.   
     """
     logging.getLogger(__name__).info(
         "Seeding experiment",
@@ -60,25 +60,12 @@ def safe_load_state_dict(
     *,
     map_location: str | torch.device | None = None,
 ) -> dict[str, Any]:
-    """Load a state_dict with ``weights_only`` when supported by PyTorch.
-
-    Newer PyTorch versions support ``torch.load(..., weights_only=True)``
-    for safer checkpoint loading (see the PyTorch docs). To remain compatible
-    with older versions that don't accept this argument, we fall back to a
-    standard ``torch.load`` call when a ``TypeError`` is raised.
-    """
-    logger = logging.getLogger(__name__)
+    """Load a state_dict with ``weights_only`` when supported by PyTorch."""
 
     try:
         state = torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
-        # Older PyTorch: no ``weights_only`` argument.
-        logger.warning(
-            "torch.load(..., weights_only=True) is not supported in this "
-            "PyTorch version; falling back to torch.load without weights_only."
-        )
         state = torch.load(path, map_location=map_location)
 
-    # `torch.load` is typed as returning `Any`; at call sites we only ever use
-    # it for model state dicts, so we narrow the type here for static checking.
+    # Narrow the type here for static checking.
     return cast(dict[str, Any], state)

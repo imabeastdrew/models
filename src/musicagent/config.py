@@ -8,7 +8,7 @@ import torch
 
 @dataclass
 class DataConfig:
-    """Configuration for data preprocessing and loading."""
+    """For preprocessing and loading."""
 
     # Paths
     data_raw: Path = Path("sheetsage-data/hooktheory/Hooktheory.json")
@@ -17,9 +17,9 @@ class DataConfig:
     # Constants
     frame_rate: int = 4  # 16th notes
     center_midi: int = 60
-    max_len: int = 256  # Model Input Length
-    storage_len: int = 1024  # Disk Storage Length (to allow random cropping)
-    max_transpose: int = 6  # Maximum semitone shift for data augmentation and vocab building
+    max_len: int = 256 
+    storage_len: int = 1024  # For random cropping
+    max_transpose: int = 6  # For augmentation 
 
     # Tokens
     pad_token: str = "<pad>"

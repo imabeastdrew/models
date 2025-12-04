@@ -84,8 +84,8 @@ class OfflineDataset(BaseDataset):
             semitones = self._sample_safe_semitones(chord_frames)
 
             if semitones != 0:
-                melody_frames = self._transpose_melody(melody_frames, semitones)
-                chord_frames = self._transpose_chord(chord_frames, semitones)
+            melody_frames = self._transpose_melody(melody_frames, semitones)
+            chord_frames = self._transpose_chord(chord_frames, semitones)
         else:
             # Validation/Test: Just truncate (no augmentation).
             melody_frames = melody_frames[:max_frames]
