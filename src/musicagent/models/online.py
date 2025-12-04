@@ -198,11 +198,15 @@ class OnlineTransformer(nn.Module):
             return_dict=True,
         )
 
-        hidden_states = outputs.last_hidden_state
-        logits = self.fc_out(hidden_states)
+        hidden_states = cast(torch.Tensor, outputs.last_hidden_state)
+        logits = cast(torch.Tensor, self.fc_out(hidden_states))
 
         if use_cache:
-            return logits, outputs.past_key_values
+            past_kv = cast(
+                tuple[tuple[torch.Tensor, torch.Tensor], ...],
+                outputs.past_key_values,
+            )
+            return logits, past_kv
         return logits
 
     def enable_gradient_checkpointing(self) -> None:
