@@ -24,9 +24,34 @@ logger = logging.getLogger(__name__)
 
 
 class Vocabulary:
-    def __init__(self, name: str, config: DataConfig):
+    def __init__(
+        self,
+        name: str,
+        config: DataConfig,
+        *,
+        strict_unknown_tokens: bool = False,
+        unknown_token_warn_limit: int = 20,
+    ):
+        """Simple token→ID vocabulary used during preprocessing.
+
+        Args:
+            name:
+                Human‑readable name for logging (e.g. "melody" or "chord").
+            config:
+                DataConfig containing special token IDs.
+            strict_unknown_tokens:
+                If True, :meth:`get_id` will raise a ``KeyError`` when asked to
+                resolve an unknown token instead of silently mapping it to REST.
+            unknown_token_warn_limit:
+                Maximum number of warnings to emit for unknown tokens before
+                suppressing further messages (when not in strict mode).
+        """
         self.name = name
         self.config = config
+        self.strict_unknown_tokens = strict_unknown_tokens
+        self.unknown_token_warn_limit = max(0, int(unknown_token_warn_limit))
+        self._unknown_token_count = 0
+
         self.token_to_id: dict[str, int] = {
             config.pad_token: config.pad_id,
             config.sos_token: config.sos_id,
@@ -45,7 +70,36 @@ class Vocabulary:
             self.next_id += 1
 
     def get_id(self, token: str) -> int:
-        return self.token_to_id.get(token, self.config.rest_id)
+        """Return the ID for ``token``, handling unknowns according to policy.
+
+        By default, unknown tokens are mapped to REST but we also log a warning
+        for the first few occurrences to surface potential schema drift. When
+        ``strict_unknown_tokens`` is enabled, an unknown token raises instead.
+        """
+        # Fast path for in‑vocab tokens.
+        token_id = self.token_to_id.get(token)
+        if token_id is not None:
+            return token_id
+
+        # Strict mode: fail fast so mapping bugs don't go unnoticed.
+        if self.strict_unknown_tokens:
+            raise KeyError(f"Vocabulary '{self.name}': unknown token {token!r}")
+
+        # Non‑strict mode: map to REST but emit a limited number of warnings.
+        if self._unknown_token_count < self.unknown_token_warn_limit:
+            self._unknown_token_count += 1
+            suffix = ""
+            if self._unknown_token_count == self.unknown_token_warn_limit:
+                suffix = " (further unknown-token warnings will be suppressed)"
+
+            logger.warning(
+                "Vocabulary '%s': unknown token %r not in vocab; mapping to REST%s",
+                self.name,
+                token,
+                suffix,
+            )
+
+        return self.config.rest_id
 
     def save(self, path: Path) -> None:
         with open(path, "w") as f:
@@ -75,8 +129,24 @@ def get_transposed_pitch(pitch: int, semitones: int) -> int:
     return max(0, min(127, new_pitch))
 
 
-def process_dataset(config: DataConfig) -> None:
-    """Run preprocessing, given a `DataConfig`."""
+def process_dataset(
+    config: DataConfig,
+    *,
+    strict_unknown_tokens: bool = False,
+    unknown_token_warn_limit: int = 20,
+) -> None:
+    """Run preprocessing, given a `DataConfig`.
+
+    Args:
+        config:
+            Data configuration controlling paths and special token IDs.
+        strict_unknown_tokens:
+            If True, raise an error when an unknown melody/chord token is
+            encountered instead of silently mapping it to REST.
+        unknown_token_warn_limit:
+            Maximum number of warnings to emit for unknown tokens before
+            suppressing further messages (only used when not in strict mode).
+    """
 
     if not config.data_raw.exists():
         raise FileNotFoundError(f"{config.data_raw} does not exist")
@@ -84,8 +154,18 @@ def process_dataset(config: DataConfig) -> None:
     config.data_processed.mkdir(exist_ok=True, parents=True)
     logger.info(f"Processing {config.data_raw}...")
 
-    melody_vocab = Vocabulary("melody", config)
-    chord_vocab = Vocabulary("chord", config)
+    melody_vocab = Vocabulary(
+        "melody",
+        config,
+        strict_unknown_tokens=strict_unknown_tokens,
+        unknown_token_warn_limit=unknown_token_warn_limit,
+    )
+    chord_vocab = Vocabulary(
+        "chord",
+        config,
+        strict_unknown_tokens=strict_unknown_tokens,
+        unknown_token_warn_limit=unknown_token_warn_limit,
+    )
     chord_mapper = ChordMapper()
 
     # ------------------------------------------------------------------
@@ -242,7 +322,11 @@ def main() -> None:
     if args.output:
         cfg.data_processed = args.output
 
-    process_dataset(cfg)
+    process_dataset(
+        cfg,
+        strict_unknown_tokens=args.strict_unknown_tokens,
+        unknown_token_warn_limit=args.unknown_token_warn_limit,
+    )
 
 
 if __name__ == "__main__":

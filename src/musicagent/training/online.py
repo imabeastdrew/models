@@ -10,7 +10,6 @@ from dataclasses import asdict
 import torch
 import torch.nn as nn
 import wandb
-from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import Adafactor
 
@@ -19,24 +18,9 @@ from musicagent.config import DataConfig, OnlineConfig
 from musicagent.data.online import OnlineDataset, make_online_collate_fn
 from musicagent.models import OnlineTransformer
 from musicagent.utils import seed_everything, setup_logging
+from musicagent.utils.train import count_parameters, get_constant_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
-
-
-def get_constant_schedule_with_warmup(optimizer, num_warmup_steps: int):
-    """Linear warmup followed by a constant learning rate."""
-
-    def lr_lambda(current_step: int):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        return 1.0
-
-    return LambdaLR(optimizer, lr_lambda)
-
-
-def count_parameters(model: nn.Module) -> int:
-    """Count trainable parameters in a model."""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def train_steps(
