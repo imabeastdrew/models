@@ -263,7 +263,7 @@ def train_online(args: argparse.Namespace) -> None:
 
     # Use unified vocab's pad_id for loss masking
     # In the unified vocab, pad_id is the same as melody's pad_id (0)
-    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
 
     # Training schedule is purely step-based: --max-steps must be provided
     # and determines when training stops.
