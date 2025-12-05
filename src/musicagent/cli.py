@@ -20,56 +20,50 @@ def _build_train_parser(description: str, default_save_dir: Path) -> argparse.Ar
         "--max-steps",
         type=int,
         default=None,
-        help=(
-            "Maximum number of optimizer steps. Training is purely step-based "
-            "and stops once this many optimizer steps have been taken."
-        ),
     )
     parser.add_argument(
         "--save-dir",
         type=Path,
         default=default_save_dir,
-        help="Directory to store checkpoints and configs.",
     )
     parser.add_argument(
         "--no-wandb",
         action="store_true",
-        help="Disable Weights & Biases logging.",
     )
     parser.add_argument(
         "--wandb-project",
         type=str,
         default="musicagent",
-        help="Weights & Biases project name.",
     )
-    parser.add_argument("--run-name", type=str, default=None, help="Custom wandb run name.")
+    parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument(
         "--resume-from",
         type=Path,
         default=None,
-        help="Path to a model checkpoint (.pt) to warm-start from.",
     )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--deterministic",
         action="store_true",
-        help="Enable deterministic training (may be slower).",
     )
 
     # Data hyperparameters
-    parser.add_argument("--max-len", type=int, help="Maximum input length.")
-    parser.add_argument("--storage-len", type=int, help="Sequence length on disk.")
-    parser.add_argument("--max-transpose", type=int, help="Max semitone shift.")
+    parser.add_argument("--max-len", type=int)
+    parser.add_argument("--storage-len", type=int)
+    parser.add_argument("--max-transpose", type=int)
 
     # Model / training hyperparameters
-    parser.add_argument("--d-model", type=int, help="Model dimension.")
-    parser.add_argument("--n-heads", type=int, help="Number of attention heads.")
-    parser.add_argument("--n-layers", type=int, help="Number of layers.")
-    parser.add_argument("--dropout", type=float, help="Dropout rate.")
-    parser.add_argument("--batch-size", type=int, help="Batch size.")
-    parser.add_argument("--lr", type=float, help="Learning rate.")
-    parser.add_argument("--warmup-steps", type=int, help="Warmup steps.")
-    parser.add_argument("--device", type=str, help="Device to use (cuda/cpu).")
+    parser.add_argument("--d-model", type=int)
+    parser.add_argument("--n-heads", type=int)
+    parser.add_argument("--n-layers", type=int)
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--lr", type=float)
+    parser.add_argument("--warmup-steps", type=int)
+    parser.add_argument( "--label-smoothing", type=float)
+    parser.add_argument("--grad-clip",type=float)
+    parser.add_argument("--weight-decay",type=float)
+    parser.add_argument("--device", type=str)
 
     return parser
 
@@ -97,25 +91,21 @@ def _build_eval_parser(description: str, default_checkpoint: Path) -> argparse.A
         "--checkpoint",
         type=Path,
         default=default_checkpoint,
-        help="Path to model checkpoint.",
     )
-    parser.add_argument("--batch-size", type=int, default=32, help="Evaluation batch size.")
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
         "--device",
         type=str,
         default=None,
-        help="Device to use (overrides config device if set).",
     )
     parser.add_argument(
         "--sample",
         action="store_true",
-        help="Sample from distribution instead of greedy decoding.",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=1.0,
-        help="Sampling temperature (only used with --sample).",
     )
     return parser
 
@@ -144,23 +134,15 @@ def build_preprocess_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Preprocess HookTheory data to numpy arrays.",
     )
-    parser.add_argument("--input", type=Path, help="Input JSON path.")
-    parser.add_argument("--output", type=Path, help="Output directory.")
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--strict-unknown-tokens",
         action="store_true",
-        help=(
-            "Fail preprocessing with an error if an unknown melody/chord token is "
-            "encountered instead of silently mapping it to REST."
-        ),
     )
     parser.add_argument(
         "--unknown-token-warn-limit",
         type=int,
         default=20,
-        help=(
-            "Maximum number of warnings to emit for unknown tokens before "
-            "suppressing further messages (only used when not in strict mode)."
-        ),
     )
     return parser

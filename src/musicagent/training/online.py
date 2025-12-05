@@ -34,6 +34,7 @@ def train_steps(
     use_wandb: bool = True,
     log_interval: int = 100,
     max_steps: int | None = None,
+    grad_clip: float = 0.5,
 ):
     """Train for a series of steps over the given loader.
 
@@ -75,7 +76,8 @@ def train_steps(
         loss = criterion(output.reshape(-1, output.size(-1)), targets.reshape(-1))
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
         scheduler.step()
 
@@ -184,6 +186,12 @@ def train_online(args: argparse.Namespace) -> None:
         m_cfg.lr = args.lr
     if args.warmup_steps is not None:
         m_cfg.warmup_steps = args.warmup_steps
+    if args.label_smoothing is not None:
+        m_cfg.label_smoothing = args.label_smoothing
+    if args.grad_clip is not None:
+        m_cfg.grad_clip = args.grad_clip
+    if args.weight_decay is not None:
+        m_cfg.weight_decay = args.weight_decay
 
     # Validate configuration
     if m_cfg.d_model % m_cfg.n_heads != 0:
@@ -256,6 +264,7 @@ def train_online(args: argparse.Namespace) -> None:
     optimizer = Adafactor(
         model.parameters(),
         lr=m_cfg.lr,
+        weight_decay=m_cfg.weight_decay,
         relative_step=False,
         scale_parameter=False,
         warmup_init=False,
@@ -263,7 +272,10 @@ def train_online(args: argparse.Namespace) -> None:
 
     # Use unified vocab's pad_id for loss masking
     # In the unified vocab, pad_id is the same as melody's pad_id (0)
-    criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=d_cfg.pad_id,
+        label_smoothing=m_cfg.label_smoothing,
+    )
 
     # Training schedule is purely step-based: --max-steps must be provided
     # and determines when training stops.
@@ -292,8 +304,6 @@ def train_online(args: argparse.Namespace) -> None:
                 "max_len": d_cfg.max_len,
                 "frame_rate": d_cfg.frame_rate,
                 "storage_len": d_cfg.storage_len,
-                "weight_decay": 0.0,
-                "grad_clip": 0.5,
                 "melody_vocab_size": melody_vocab_size,
                 "chord_vocab_size": chord_vocab_size,
                 "total_params": total_params,
@@ -325,6 +335,7 @@ def train_online(args: argparse.Namespace) -> None:
             global_step,
             use_wandb,
             max_steps=max_steps,
+            grad_clip=m_cfg.grad_clip,
         )
         val_loss = evaluate(model, valid_loader, criterion, device)
         try:

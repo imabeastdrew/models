@@ -63,6 +63,9 @@ class OfflineConfig:
     batch_size: int = 256
     lr: float = 1e-3
     warmup_steps: int = 1000
+    label_smoothing: float = 0.1
+    grad_clip: float = 0.5
+    weight_decay: float = 0.0
 
     device: str = field(default_factory=lambda: ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -81,5 +84,8 @@ class OnlineConfig:
     batch_size: int = 256
     lr: float = 1e-3
     warmup_steps: int = 1000
+    label_smoothing: float = 0.1
+    grad_clip: float = 0.5
+    weight_decay: float = 0.0
 
     device: str = field(default_factory=lambda: ("cuda" if torch.cuda.is_available() else "cpu"))
