@@ -94,26 +94,6 @@ class OnlineDataset(BaseDataset):
         # computed from the separate vocab files. We use those inherited values
         # directly rather than recalculating from the unified vocab views.
 
-    def _melody_to_unified(self, token_id: int) -> int:
-        """Convert melody token ID to unified vocab ID.
-
-        For datasets preprocessed with a unified vocabulary, tokens on disk are
-        already in unified ID space so this is an identity mapping. For older
-        datasets (tests), melody tokens also live in their own contiguous range
-        starting at 0, so this remains an identity mapping.
-        """
-        return int(token_id)
-
-    def _chord_to_unified(self, token_id: int) -> int:
-        """Convert chord token ID to unified vocab ID.
-
-        In the current pipeline all sequences on disk already use the unified
-        ID space produced by preprocessing, so this is effectively an identity
-        mapping. We keep the helper for clarity and symmetry with
-        ``_melody_to_unified``.
-        """
-        return int(token_id)
-
     def _interleave(
         self,
         melody_seq: np.ndarray,

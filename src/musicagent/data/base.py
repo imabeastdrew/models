@@ -70,13 +70,6 @@ class BaseDataset(Dataset, ABC):
         else:
             self.chord_vocab_size = 0
 
-        # Expose a synthetic "unified" vocab size equal to the sum of the
-        # melody and chord vocab sizes. This is retained for backward
-        # compatibility with helper utilities that size shared structures
-        # using a single scalar, but the model and datasets operate strictly
-        # in their respective vocab spaces.
-        self.unified_vocab_size: int = self.melody_vocab_size + self.chord_vocab_size
-
         # Derive melody / chord views (string → ID) for transposition table
         # construction. These simply mirror the token_to_id mappings.
         self.vocab_melody: dict[str, int] = dict(self.melody_token_to_id)
@@ -301,15 +294,6 @@ def _collate_offline(
         tgt_batch[i, :length] = seq
 
     return src_batch, tgt_batch
-
-
-def collate_fn(batch: list) -> tuple[torch.Tensor, torch.Tensor]:
-    """Default collate function for offline dataset.
-
-    This mirrors the original behavior and assumes PAD has ID 0. It is kept
-    for backward compatibility in tests and simple usage.
-    """
-    return _collate_offline(batch, pad_id=0)
 
 
 def make_offline_collate_fn(pad_id: int = 0):
