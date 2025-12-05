@@ -18,7 +18,6 @@ from musicagent.eval.offline import main as offline_main
 from musicagent.eval.online import (
     OnlineEvalResult,
     evaluate_online,
-    extract_melody_and_chords,
 )
 from musicagent.eval.online import (
     main as online_main,
@@ -37,7 +36,6 @@ __all__ = [
     # Evaluation functions
     "evaluate_offline",
     "evaluate_online",
-    "extract_melody_and_chords",
     # Result containers
     "OfflineEvalResult",
     "OnlineEvalResult",

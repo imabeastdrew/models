@@ -146,4 +146,21 @@ def build_preprocess_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", type=Path, help="Input JSON path.")
     parser.add_argument("--output", type=Path, help="Output directory.")
+    parser.add_argument(
+        "--strict-unknown-tokens",
+        action="store_true",
+        help=(
+            "Fail preprocessing with an error if an unknown melody/chord token is "
+            "encountered instead of silently mapping it to REST."
+        ),
+    )
+    parser.add_argument(
+        "--unknown-token-warn-limit",
+        type=int,
+        default=20,
+        help=(
+            "Maximum number of warnings to emit for unknown tokens before "
+            "suppressing further messages (only used when not in strict mode)."
+        ),
+    )
     return parser
