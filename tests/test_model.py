@@ -3,34 +3,7 @@
 import torch
 
 from musicagent.config import DataConfig, OfflineConfig, OnlineConfig
-from musicagent.models import OfflineTransformer, OnlineTransformer, PositionalEncoding
-
-
-def test_positional_encoding_shape() -> None:
-    """PositionalEncoding should add positional info without changing shape."""
-    d_model = 32
-    max_len = 100
-    pe = PositionalEncoding(d_model=d_model, max_len=max_len)
-
-    batch_size = 2
-    seq_len = 16
-    x = torch.zeros((batch_size, seq_len, d_model))
-    out = pe(x)
-
-    assert out.shape == x.shape
-    # Output should differ from input (positional encoding was added)
-    assert not torch.allclose(out, x)
-
-
-def test_positional_encoding_deterministic() -> None:
-    """Same input should produce same output (no randomness in PE)."""
-    pe = PositionalEncoding(d_model=16, max_len=50)
-    x = torch.randn(2, 10, 16)
-
-    out1 = pe(x)
-    out2 = pe(x)
-
-    assert torch.allclose(out1, out2)
+from musicagent.models import OfflineTransformer, OnlineTransformer
 
 
 def test_offline_transformer_forward_shapes() -> None:
