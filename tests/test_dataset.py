@@ -11,7 +11,7 @@ from musicagent.config import DataConfig
 from musicagent.data import (
     OfflineDataset,
     OnlineDataset,
-    collate_fn,
+    make_offline_collate_fn,
     make_online_collate_fn,
 )
 
@@ -238,12 +238,13 @@ def test_transpose_zero_semitones_unchanged(tmp_path: Path) -> None:
     assert np.array_equal(original, transposed)
 
 
-def test_collate_fn_stacks_batches(tmp_path: Path) -> None:
+def test_offline_collate_fn_stacks_batches(tmp_path: Path) -> None:
     cfg = DataConfig(data_processed=tmp_path, storage_len=32, max_len=16)
     _create_test_dataset(tmp_path, cfg, n_samples=4)
     ds = OfflineDataset(cfg, split="valid")
     batch = [ds[i] for i in range(2)]
-    src_batch, tgt_batch = collate_fn(batch)
+    collate = make_offline_collate_fn(pad_id=cfg.pad_id)
+    src_batch, tgt_batch = collate(batch)
     assert src_batch.shape == (2, cfg.max_len)
     assert tgt_batch.shape == (2, cfg.max_len)
 
@@ -288,15 +289,14 @@ def test_online_dataset_returns_interleaved(tmp_path: Path) -> None:
     assert 0 < sample["input_ids"].shape[0] <= 1 + 2 * cfg.max_len
 
 
-def test_online_dataset_unified_vocab_size(tmp_path: Path) -> None:
-    """OnlineDataset should compute correct unified vocab size."""
+def test_online_dataset_vocab_sizes(tmp_path: Path) -> None:
+    """OnlineDataset should compute correct per-vocab sizes."""
     cfg = DataConfig(data_processed=tmp_path, storage_len=32, max_len=16)
     melody_vocab, chord_vocab = _create_test_dataset(tmp_path, cfg)
     ds = OnlineDataset(cfg, split="train")
 
     assert ds.melody_vocab_size == len(melody_vocab)
     assert ds.chord_vocab_size == len(chord_vocab)
-    assert ds.unified_vocab_size == len(melody_vocab) + len(chord_vocab)
 
 
 def test_online_dataset_interleave_format(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@
 import torch.nn as nn
 import torch.optim as optim
 
-from musicagent.training.offline import count_parameters, get_constant_schedule_with_warmup
+from musicagent.utils.train import count_parameters, get_constant_schedule_with_warmup
 
 
 def test_count_parameters() -> None:

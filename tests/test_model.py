@@ -316,9 +316,7 @@ def test_online_generate_with_variable_length_batch() -> None:
 
     # Generate melody_0 individually (unbatched) and verify it matches the batched result
     # This confirms that padding in other batch items doesn't affect generation
-    chords_0_individual = model.generate(
-        melody_0, sos_id=d_cfg.sos_id, eos_id=d_cfg.eos_id
-    )
+    chords_0_individual = model.generate(melody_0, sos_id=d_cfg.sos_id, eos_id=d_cfg.eos_id)
 
     # The first melody's chords should be identical whether batched or individual
     # (since it has no padding and shouldn't be affected by other batch items)
