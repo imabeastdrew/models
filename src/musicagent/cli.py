@@ -60,9 +60,9 @@ def _build_train_parser(description: str, default_save_dir: Path) -> argparse.Ar
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--warmup-steps", type=int)
-    parser.add_argument( "--label-smoothing", type=float)
-    parser.add_argument("--grad-clip",type=float)
-    parser.add_argument("--weight-decay",type=float)
+    parser.add_argument("--label-smoothing", type=float)
+    parser.add_argument("--grad-clip", type=float)
+    parser.add_argument("--weight-decay", type=float)
     parser.add_argument("--device", type=str)
 
     return parser
