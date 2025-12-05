@@ -181,9 +181,12 @@ def compute_test_set_histograms(
     melody–chord root harmonic intervals.
 
     Args:
-        test_loader: DataLoader yielding (src, tgt) batches where src is melody
-            IDs and tgt is chord IDs.
-        id_to_token: Mapping from unified token ID to string token.
+        test_loader: DataLoader yielding ``(src, tgt)`` batches where ``src`` is
+            a sequence of melody token IDs and ``tgt`` is a sequence of chord
+            token IDs (in whatever ID spaces your loader uses).
+        id_to_token: Mapping from token ID to string token. This can be a
+            unified or per-modality mapping, as long as it is consistent with
+            the IDs contained in ``src`` and ``tgt``.
         max_onset_bin: Maximum bin for onset-interval histogram (frames).
         max_length_bin: Maximum bin for chord-length histogram (frames).
 

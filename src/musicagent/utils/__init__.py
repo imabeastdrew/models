@@ -49,7 +49,6 @@ __all__ = [
     "create_test_loader",
     "evaluate_checkpoint",
     "evaluate_artifact",
-    "evaluate_wandb_artifact",
     "load_model_from_artifact",
     # Analysis
     "AdaptationDynamicsResult",

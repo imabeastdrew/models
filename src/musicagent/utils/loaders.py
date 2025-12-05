@@ -58,24 +58,21 @@ def load_model_from_artifact(
     # Get vocab sizes from a temporary dataset
     temp_ds: Any = reg.dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
 
-    if model_type == "online":
-        vocab_size = temp_ds.unified_vocab_size
-        chord_token_ids = sorted(temp_ds.vocab_chord.values())
-        model = reg.model_class(
-            m_cfg,
-            d_cfg,
-            vocab_size=vocab_size,
-            chord_token_ids=chord_token_ids,
+    melody_vocab_size = getattr(temp_ds, "melody_vocab_size", None)
+    chord_vocab_size = getattr(temp_ds, "chord_vocab_size", None)
+
+    if melody_vocab_size is None or chord_vocab_size is None:
+        raise AttributeError(
+            "Dataset does not expose melody_vocab_size / chord_vocab_size "
+            "required for model construction."
         )
-    else:
-        vocab_size = temp_ds.unified_vocab_size
-        chord_token_ids = sorted(temp_ds.vocab_chord.values())
-        model = reg.model_class(
-            m_cfg,
-            d_cfg,
-            vocab_size=vocab_size,
-            chord_token_ids=chord_token_ids,
-        )
+
+    model = reg.model_class(
+        m_cfg,
+        d_cfg,
+        melody_vocab_size=melody_vocab_size,
+        chord_vocab_size=chord_vocab_size,
+    )
 
     model = model.to(device)
     state = safe_load_state_dict(checkpoint_path, map_location=device)
@@ -139,8 +136,8 @@ def create_test_loader(
         test_dataset=test_ds,
         id_to_melody=id_to_melody,
         id_to_chord=id_to_chord,
-        melody_vocab_size=getattr(test_ds, "melody_vocab_size", len(id_to_melody)),
-        chord_vocab_size=getattr(test_ds, "chord_vocab_size", len(id_to_chord)),
+        melody_vocab_size=test_ds.melody_vocab_size,
+        chord_vocab_size=test_ds.chord_vocab_size,
     )
 
 
