@@ -33,19 +33,12 @@ command:
   - ${interpreter}
   - -m
   - ${program}
-  - --save-dir
-  - ${save_dir}
-  - --lr
-  - ${lr}
-  - --warmup-steps
-  - ${warmup_steps}
-  - --lr-schedule
-  - ${lr_schedule}
-  - --max-steps
-  - ${max_steps}
-  - --batch-size
-  - ${batch_size}
-  - --wandb-project
-  - ${wandb_project}
+  - --save-dir=${save_dir}
+  - --lr=${lr}
+  - --warmup-steps=${warmup_steps}
+  - --lr-schedule=${lr_schedule}
+  - --max-steps=${max_steps}
+  - --batch-size=${batch_size}
+  - --wandb-project=${wandb_project}
 
 
