@@ -18,7 +18,12 @@ from musicagent.config import DataConfig, OfflineConfig
 from musicagent.data import OfflineDataset, make_offline_collate_fn
 from musicagent.models import OfflineTransformer
 from musicagent.utils import seed_everything, setup_logging
-from musicagent.utils.train import count_parameters, get_constant_schedule_with_warmup
+from musicagent.utils.train import (
+    count_parameters,
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_linear_schedule_with_warmup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,7 +274,27 @@ def train_offline(args: argparse.Namespace) -> None:
             "`--max-steps` to specify the total number of optimizer steps."
         )
     max_steps = args.max_steps
-    scheduler = get_constant_schedule_with_warmup(optimizer, m_cfg.warmup_steps)
+
+    # Learning rate schedule: warmup+constant (paper-faithful), warmup+linear
+    # decay, or warmup+cosine decay to zero over the full training horizon.
+    schedule = getattr(args, "lr_schedule", "constant")
+    if schedule == "linear":
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=m_cfg.warmup_steps,
+            num_training_steps=max_steps,
+        )
+    elif schedule == "cosine":
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=m_cfg.warmup_steps,
+            num_training_steps=max_steps,
+        )
+    else:
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=m_cfg.warmup_steps,
+        )
 
     # Initialize wandb
     use_wandb = not args.no_wandb
