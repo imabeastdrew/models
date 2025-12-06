@@ -64,10 +64,7 @@ def _build_train_parser(description: str, default_save_dir: Path) -> argparse.Ar
     parser.add_argument("--grad-clip", type=float)
     parser.add_argument("--weight-decay", type=float)
     parser.add_argument(
-        "--lr-schedule",
-        type=str,
-        choices=["constant", "linear", "cosine"],
-        default="constant"
+        "--lr-schedule", type=str, choices=["constant", "linear", "cosine"], default="constant"
     )
     parser.add_argument("--device", type=str)
 
