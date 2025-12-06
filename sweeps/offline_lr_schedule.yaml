@@ -1,0 +1,51 @@
+program: musicagent.training.offline
+
+method: bayes
+
+metric:
+  name: valid/loss
+  goal: minimize
+
+parameters:
+  save_dir:
+    value: checkpoints-offline
+
+  lr:
+    values: [0.0003, 0.0006, 0.001, 0.002]
+
+  warmup_steps:
+    values: [500, 1000, 2000, 4000]
+
+  lr_schedule:
+    values: ["linear", "cosine"]
+
+  max_steps:
+    value: 30000
+
+  batch_size:
+    value: 256
+
+  wandb_project:
+    value: "musicagent"
+
+command:
+  - ${env}
+  - ${interpreter}
+  - -m
+  - ${program}
+  - --save-dir
+  - ${save_dir}
+  - --lr
+  - ${lr}
+  - --warmup-steps
+  - ${warmup_steps}
+  - --lr-schedule
+  - ${lr_schedule}
+  - --max-steps
+  - ${max_steps}
+  - --batch-size
+  - ${batch_size}
+  - --wandb-project
+  - ${wandb_project}
+
+
