@@ -10,19 +10,24 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.24.0",
     "torch>=2.0.0",
+    "lightning>=2.0.0",
     "transformers>=4.40.0",
+    "x-transformers>=1.27.9",
     "ijson>=3.2.0",
     "tqdm>=4.65.0",
     "wandb>=0.16.0",
     "matplotlib<3.10",
     "matplotlib-inline>=0.2.1",
+    "music21>=8.0.0",
+    "note-seq>=0.0.5",
+    "pretty_midi>=0.2.10",
 ]
 
 [project.scripts]
-musicagent-train = "musicagent.training:main"
-musicagent-train-offline = "musicagent.training.offline:main"
-musicagent-train-online = "musicagent.training.online:main"
 musicagent-preprocess = "musicagent.scripts.preprocess:main"
+musicagent-preprocess-nottingham = "musicagent.scripts.nottingham:main"
+musicagent-preprocess-wikifonia = "musicagent.scripts.wikifonia:main"
+musicagent-preprocess-pop909 = "musicagent.scripts.pop909:main"
 musicagent-eval-offline = "musicagent.eval.offline:main"
 musicagent-eval-online = "musicagent.eval.online:main"
 musicagent-eval = "musicagent.eval:main"

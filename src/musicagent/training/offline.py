@@ -1,23 +1,37 @@
-"""Script for offline model."""
+"""Lightning-based components for offline (encoder–decoder) training.
 
-import argparse
+This module defines:
+- ``OfflineLightningModule``: wraps ``OfflineTransformer`` in a LightningModule.
+- ``build_offline_module_and_loaders``: constructs datasets, dataloaders, and module
+  from ``DataConfig`` and ``OfflineConfig``.
+
+There is intentionally **no CLI** here; training should be driven by configs and an
+external script that instantiates a ``lightning.Trainer``.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import math
-import time
 from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Tuple
 
+import lightning as L
 import torch
 import torch.nn as nn
-import wandb
 from torch.utils.data import DataLoader
+from torch.utils.data.sampler import WeightedRandomSampler
 from transformers import Adafactor
 
-from musicagent.cli import build_train_offline_parser
 from musicagent.config import DataConfig, OfflineConfig
-from musicagent.data import OfflineDataset, make_offline_collate_fn
+from musicagent.data import (
+    OfflineDataset,
+    WeightedJointOfflineDataset,
+    make_offline_collate_fn,
+)
 from musicagent.models import OfflineTransformer
-from musicagent.utils import seed_everything, setup_logging
 from musicagent.utils.train import (
     count_parameters,
     get_constant_schedule_with_warmup,
@@ -28,398 +42,290 @@ from musicagent.utils.train import (
 logger = logging.getLogger(__name__)
 
 
-def train_steps(
-    model,
-    loader,
-    optimizer,
-    scheduler,
-    criterion,
-    device,
-    global_step,
-    use_wandb: bool = True,
-    log_interval: int = 100,
-    max_steps: int | None = None,
-    grad_clip: float = 0.5,
-):
-    """Train for a series of steps over the given loader."""
-    model.train()
-    total_loss = 0.0
-    start_time = time.time()
+def _normalize_weights(weights: list[float], n: int) -> list[float]:
+    if not weights:
+        return [1.0 / n for _ in range(n)]
+    if len(weights) != n:
+        if len(weights) == 1:
+            weights = [weights[0]] * n
+        else:
+            weights = weights[:n] + [1.0] * max(0, n - len(weights))
+    total = sum(weights)
+    if total <= 0:
+        return [1.0 / n for _ in range(n)]
+    return [w / total for w in weights]
 
-    for i, batch in enumerate(loader):
-        if max_steps is not None and global_step >= max_steps:
-            break
-        # DataLoader + collate_fn returns a tuple (src_batch, tgt_batch).
+
+def _resolve_sources(cfg: DataConfig) -> list[tuple[str, Path, float]]:
+    paths = cfg.data_processed_list or [cfg.data_processed]
+    weights = _normalize_weights(cfg.data_weights, len(paths))
+    sources: list[tuple[str, Path, float]] = []
+    for path, w in zip(paths, weights):
+        name = Path(path).name or str(path)
+        sources.append((name, Path(path), w))
+    return sources
+
+
+class OfflineLightningModule(L.LightningModule):
+    """LightningModule wrapping the offline encoder–decoder transformer."""
+
+    def __init__(
+        self,
+        data_cfg: DataConfig,
+        model_cfg: OfflineConfig,
+        vocab_size: int,
+        max_steps: int,
+        lr_schedule: str = "constant",
+        save_dir: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.data_cfg = data_cfg
+        self.model_cfg = model_cfg
+        self.vocab_size = vocab_size
+        self.max_steps = max_steps
+        self.lr_schedule = lr_schedule
+        self.save_dir = save_dir or Path("checkpoints/offline")
+
+        self.model = OfflineTransformer(
+            model_cfg,
+            data_cfg,
+            vocab_size=vocab_size,
+        )
+        self.criterion = nn.CrossEntropyLoss(
+            ignore_index=data_cfg.pad_id,
+            label_smoothing=model_cfg.label_smoothing,
+        )
+        self.best_val_loss: float = float("inf")
+
+        # Store hyperparameters for checkpointing / logging (as plain dicts)
+        self.save_hyperparameters(
+            {
+                "data_cfg": asdict(data_cfg),
+                "model_cfg": asdict(model_cfg),
+                "max_steps": max_steps,
+                "lr_schedule": lr_schedule,
+            }
+        )
+
+    def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        return self.model(src, tgt)
+
+    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         if isinstance(batch, tuple):
             src, tgt = batch
         else:
             src = batch["src"]
             tgt = batch["tgt"]
 
-        src = src.to(device)
-        tgt = tgt.to(device)
+        tgt_input = tgt[:, :-1]
+        tgt_y = tgt[:, 1:]
+
+        output = self(src, tgt_input)
+        loss = self.criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
+
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        return loss
+
+    def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        if isinstance(batch, tuple):
+            src, tgt = batch
+        else:
+            src = batch["src"]
+            tgt = batch["tgt"]
 
         tgt_input = tgt[:, :-1]
         tgt_y = tgt[:, 1:]
 
-        optimizer.zero_grad(set_to_none=True)
-        output = model(src, tgt_input)
+        output = self(src, tgt_input)
+        flat_output = output.reshape(-1, output.size(-1))
+        flat_targets = tgt_y.reshape(-1)
+        loss = self.criterion(flat_output, flat_targets)
 
-        loss = criterion(output.reshape(-1, output.size(-1)), tgt_y.reshape(-1))
-        loss.backward()
-
-        if grad_clip is not None and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-        scheduler.step()
-
-        total_loss += loss.item()
-        global_step += 1
-
-        if global_step % log_interval == 0:
-            cur_loss = total_loss / log_interval
-            elapsed = time.time() - start_time
-            lr = scheduler.get_last_lr()[0]
-            ms_per_batch = elapsed * 1000 / log_interval
-
-            logger.info(
-                f"| step {global_step} | batch {i}/{len(loader)} | "
-                f"ms/batch {ms_per_batch:.2f} | "
-                f"lr {lr:.6f} | loss {cur_loss:.4f}"
-            )
-
-            if use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": cur_loss,
-                        "train/lr": lr,
-                        "train/ms_per_batch": ms_per_batch,
-                    },
-                    step=global_step,
-                )
-
-            total_loss = 0.0
-            start_time = time.time()
-
-    return global_step
-
-
-def evaluate(model, loader, criterion, device):
-    """Evaluate model on validation/test set.
-
-    Note:
-        The returned loss is the mean of per-batch cross-entropies, i.e.
-        effectively averaged per sample, not strictly normalized by the total
-        number of (non-ignored) tokens.
-    """
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    with torch.no_grad():
-        for batch in loader:
-            if isinstance(batch, tuple):
-                src, tgt = batch
-            else:
-                src = batch["src"]
-                tgt = batch["tgt"]
-
-            src = src.to(device)
-            tgt = tgt.to(device)
-
-            tgt_input = tgt[:, :-1]
-            tgt_y = tgt[:, 1:]
-
-            output = model(src, tgt_input)
-
-            flat_output = output.reshape(-1, output.size(-1))
-            flat_targets = tgt_y.reshape(-1)
-
-            loss = criterion(flat_output, flat_targets)
-
-            batch_size = src.size(0)
-            total_loss += loss.item() * batch_size
-            total_tokens += batch_size
-
-    if total_tokens == 0:
-        return 0.0
-
-    return total_loss / total_tokens
-
-
-def train_offline(args: argparse.Namespace) -> None:
-    """Main training function for offline model."""
-    setup_logging()
-    seed_everything(args.seed, deterministic=args.deterministic)
-    args.save_dir.mkdir(exist_ok=True, parents=True)
-
-    d_cfg = DataConfig()
-    m_cfg = OfflineConfig()
-
-    # Apply CLI overrides to configs
-    if args.max_len is not None:
-        d_cfg.max_len = args.max_len
-    if args.storage_len is not None:
-        d_cfg.storage_len = args.storage_len
-    if args.max_transpose is not None:
-        d_cfg.max_transpose = args.max_transpose
-
-    if args.d_model is not None:
-        m_cfg.d_model = args.d_model
-    if args.n_heads is not None:
-        m_cfg.n_heads = args.n_heads
-    if args.n_layers is not None:
-        m_cfg.n_layers = args.n_layers
-    if args.dropout is not None:
-        m_cfg.dropout = args.dropout
-    if args.batch_size is not None:
-        m_cfg.batch_size = args.batch_size
-    if args.lr is not None:
-        m_cfg.lr = args.lr
-    if args.warmup_steps is not None:
-        m_cfg.warmup_steps = args.warmup_steps
-    if args.label_smoothing is not None:
-        m_cfg.label_smoothing = args.label_smoothing
-    if args.grad_clip is not None:
-        m_cfg.grad_clip = args.grad_clip
-    if args.weight_decay is not None:
-        m_cfg.weight_decay = args.weight_decay
-
-    # Check for valid model configuration
-    if m_cfg.d_model % m_cfg.n_heads != 0:
-        raise ValueError(
-            f"d_model ({m_cfg.d_model}) must be divisible by n_heads ({m_cfg.n_heads})"
+        self.log(
+            "valid/loss",
+            loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
         )
 
-    if args.device:
-        m_cfg.device = args.device
+        # For convenience, also log perplexity (clipped for stability).
+        with torch.no_grad():
+            val = float(loss.detach().cpu())
+            ppl = math.exp(min(val, 100.0))
+        self.log(
+            "valid/perplexity",
+            ppl,
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+        )
+        return loss
 
-    device = torch.device(m_cfg.device)
-    logger.info(f"Using device: {device}")
+    def on_validation_epoch_end(self) -> None:
+        metrics = self.trainer.callback_metrics
+        val_loss = metrics.get("valid/loss")
+        if val_loss is None:
+            return
+        loss_value = float(val_loss.detach().cpu())
+        if loss_value < self.best_val_loss:
+            self.best_val_loss = loss_value
+            self._save_best_checkpoint(loss_value)
+
+    def _save_best_checkpoint(self, val_loss: float) -> None:
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = self.save_dir / "best_model.pt"
+        torch.save(self.model.state_dict(), checkpoint_path)
+
+        data_cfg_path = self.save_dir / "data_config.json"
+        model_cfg_path = self.save_dir / "model_config.json"
+        with data_cfg_path.open("w") as f:
+            json.dump(asdict(self.data_cfg), f, default=str, indent=2)
+        with model_cfg_path.open("w") as f:
+            json.dump(asdict(self.model_cfg), f, default=str, indent=2)
+
+        logger.info(
+            "Saved best model to %s (val_loss=%.4f)",
+            checkpoint_path,
+            val_loss,
+        )
+
+    def configure_optimizers(self):
+        optimizer = Adafactor(
+            self.parameters(),
+            lr=self.model_cfg.lr,
+            weight_decay=self.model_cfg.weight_decay,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
+
+        if self.lr_schedule == "linear":
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+                num_training_steps=self.max_steps,
+            )
+        elif self.lr_schedule == "cosine":
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+                num_training_steps=self.max_steps,
+            )
+        else:
+            scheduler = get_constant_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+            )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+
+def build_offline_module_and_loaders(
+    data_cfg: DataConfig,
+    model_cfg: OfflineConfig,
+    *,
+    max_steps: int,
+    lr_schedule: str = "constant",
+    save_dir: Path | None = None,
+    seed: int = 42,
+) -> Tuple[OfflineLightningModule, DataLoader, DataLoader]:
+    """Create OfflineLightningModule and train/valid DataLoaders from configs.
+
+    This is the preferred entry point for config-driven training. Example usage:
+
+    .. code-block:: python
+
+        data_cfg = DataConfig(data_processed=Path("realchords_data"))
+        model_cfg = OfflineConfig()
+        module, train_loader, valid_loader = build_offline_module_and_loaders(
+            data_cfg, model_cfg, max_steps=100_000
+        )
+        trainer = L.Trainer(max_steps=100_000, gradient_clip_val=model_cfg.grad_clip)
+        trainer.fit(module, train_loader, valid_loader)
+    """
+    # Apply seed via PyTorch / Lightning utilities in the caller as desired.
+    del seed  # kept for future extensibility
+
+    # Validate configuration
+    if model_cfg.d_model % model_cfg.n_heads != 0:
+        raise ValueError(
+            f"d_model ({model_cfg.d_model}) must be divisible by n_heads ({model_cfg.n_heads})"
+        )
+
+    sources = _resolve_sources(data_cfg)
+    use_joint = len(sources) > 1
 
     try:
-        train_ds = OfflineDataset(d_cfg, split="train")
-        valid_ds = OfflineDataset(d_cfg, split="valid")
+        if use_joint:
+            logger.info(
+                "Using weighted joint offline datasets: %s",
+                [(n, str(p), w) for n, p, w in sources],
+            )
+            train_ds = WeightedJointOfflineDataset(data_cfg, sources, split="train")
+            valid_ds = WeightedJointOfflineDataset(
+                data_cfg, sources, split="valid", eval_mode=True
+            )
+        else:
+            train_ds = OfflineDataset(data_cfg, split="train")
+            valid_ds = OfflineDataset(data_cfg, split="valid")
     except FileNotFoundError as e:
         logger.error(e)
-        return
+        raise
 
-    collate = make_offline_collate_fn(pad_id=d_cfg.pad_id)
+    collate = make_offline_collate_fn(pad_id=data_cfg.pad_id)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=m_cfg.batch_size,
-        shuffle=True,
-        collate_fn=collate,
-    )
-    valid_loader = DataLoader(
-        valid_ds,
-        batch_size=m_cfg.batch_size,
-        collate_fn=collate,
-    )
-
-    melody_vocab_size = train_ds.melody_vocab_size
-    chord_vocab_size = train_ds.chord_vocab_size
-    logger.info(
-        "Vocab Size: Melody=%d, Chord=%d",
-        melody_vocab_size,
-        chord_vocab_size,
-    )
-
-    # Offline model uses separate embedding tables for melody (encoder) and
-    # chord (decoder) tokens, allowing each modality to develop task-appropriate
-    # representations without competing for shared embedding space.
-    model = OfflineTransformer(
-        m_cfg,
-        d_cfg,
-        melody_vocab_size=melody_vocab_size,
-        chord_vocab_size=chord_vocab_size,
-    ).to(device)
-    total_params = count_parameters(model)
-    logger.info(f"Model Parameters: {total_params:,}")
-
-    # Optionally warm-start from an existing checkpoint
-    if args.resume_from is not None:
-        if args.resume_from.is_file():
-            state_dict = torch.load(args.resume_from, map_location=device)
-            model.load_state_dict(state_dict, strict=True)
-            logger.info(f"Loaded checkpoint from {args.resume_from}")
-        else:
-            logger.warning(
-                f"--resume-from was set to {args.resume_from}, but file does not exist. "
-                "Continuing with randomly initialized weights."
-            )
-
-    # Adafactor optimizer, matching the paper's setup.
-    optimizer = Adafactor(
-        model.parameters(),
-        lr=m_cfg.lr,
-        weight_decay=m_cfg.weight_decay,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-    )
-    # Use label smoothing (as in standard T5/T5X setups) to reduce
-    # over-confidence on single tokens like EOS/REST/HOLD.
-    criterion = nn.CrossEntropyLoss(
-        ignore_index=d_cfg.pad_id,
-        label_smoothing=m_cfg.label_smoothing,
-    )
-
-    # Training schedule is purely step-based: --max-steps must be provided
-    # and determines when training stops.
-    if args.max_steps is None:
-        raise ValueError(
-            "train_offline uses step-based training; pass "
-            "`--max-steps` to specify the total number of optimizer steps."
-        )
-    max_steps = args.max_steps
-
-    # Learning rate schedule: warmup+constant (paper-faithful), warmup+linear
-    # decay, or warmup+cosine decay to zero over the full training horizon.
-    schedule = getattr(args, "lr_schedule", "constant")
-    if schedule == "linear":
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
-            num_training_steps=max_steps,
-        )
-    elif schedule == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
-            num_training_steps=max_steps,
+    if use_joint:
+        num_samples = int(math.ceil(len(train_ds) * data_cfg.train_samples_multiplier))
+        if data_cfg.max_train_samples is not None:
+            num_samples = min(num_samples, data_cfg.max_train_samples)
+        num_samples = max(1, num_samples)
+        sampler = WeightedRandomSampler(train_ds.sample_weights, num_samples, replacement=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=model_cfg.batch_size,
+            sampler=sampler,
+            collate_fn=collate,
         )
     else:
-        scheduler = get_constant_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=model_cfg.batch_size,
+            shuffle=True,
+            collate_fn=collate,
         )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=model_cfg.batch_size,
+        collate_fn=collate,
+    )
 
-    # Initialize wandb
-    use_wandb = not args.no_wandb
-    if use_wandb:
-        run_name = args.run_name or (
-            f"offline_d{m_cfg.d_model}_h{m_cfg.n_heads}_L{m_cfg.n_layers}_bs{m_cfg.batch_size}"
-        )
+    vocab_size = train_ds.vocab_size
+    logger.info("Offline vocab size: %d", vocab_size)
 
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config={
-                "model_type": "offline",
-                **asdict(m_cfg),
-                "max_len": d_cfg.max_len,
-                "frame_rate": d_cfg.frame_rate,
-                "storage_len": d_cfg.storage_len,
-                "melody_vocab_size": melody_vocab_size,
-                "chord_vocab_size": chord_vocab_size,
-                "total_params": total_params,
-                "train_samples": len(train_ds),
-                "valid_samples": len(valid_ds),
-                "total_steps": max_steps,
-            },
-            tags=["transformer", "offline", "melody-chord", "realchords"],
-        )
+    module = OfflineLightningModule(
+        data_cfg=data_cfg,
+        model_cfg=model_cfg,
+        vocab_size=vocab_size,
+        max_steps=max_steps,
+        lr_schedule=lr_schedule,
+        save_dir=save_dir or Path("checkpoints/offline"),
+    )
+    total_params = count_parameters(module.model)
+    logger.info("Offline model parameters: %d", total_params)
 
-        wandb.define_metric("train/loss", summary="min")
-        wandb.define_metric("valid/loss", summary="min")
-        wandb.define_metric("valid/perplexity", summary="min")
+    return module, train_loader, valid_loader
 
-    best_val_loss = float("inf")
-    global_step = 0
-
-    # Train until we hit the requested number of steps. Validation and
-    # checkpointing are performed after each full pass through the loader (or
-    # earlier if we exhaust the step budget mid-pass).
-    while global_step < max_steps:
-        global_step = train_steps(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            criterion,
-            device,
-            global_step,
-            use_wandb,
-            max_steps=max_steps,
-            grad_clip=m_cfg.grad_clip,
-        )
-        val_loss = evaluate(model, valid_loader, criterion, device)
-        try:
-            val_ppl = math.exp(min(val_loss, 100))
-        except OverflowError:
-            val_ppl = float("inf")
-
-        logger.info("-" * 89)
-        logger.info(
-            f"| Validation | step {global_step} | "
-            f"valid loss {val_loss:.4f} | perplexity {val_ppl:.2f}"
-        )
-        logger.info("-" * 89)
-
-        if use_wandb:
-            wandb.log(
-                {
-                    "valid/loss": val_loss,
-                    "valid/perplexity": val_ppl,
-                    "valid/step": global_step,
-                },
-                step=global_step,
-            )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            checkpoint_path = args.save_dir / "best_model.pt"
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info("Saved best model.")
-
-            # Persist the effective data/model configs alongside the checkpoint
-            data_cfg_path = args.save_dir / "data_config.json"
-            model_cfg_path = args.save_dir / "model_config.json"
-            with data_cfg_path.open("w") as f:
-                json.dump(asdict(d_cfg), f, default=str, indent=2)
-            with model_cfg_path.open("w") as f:
-                json.dump(asdict(m_cfg), f, default=str, indent=2)
-            logger.info("Saved data/model configs.")
-
-            if use_wandb and wandb.run is not None:
-                wandb.run.summary["best_val_loss"] = best_val_loss
-                try:
-                    wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
-                except OverflowError:
-                    wandb.run.summary["best_val_perplexity"] = float("inf")
-                wandb.run.summary["best_step"] = global_step
-
-                artifact = wandb.Artifact(
-                    name="best-model",
-                    type="model",
-                    metadata={
-                        "model_type": "offline",
-                        "step": global_step,
-                        "val_loss": val_loss,
-                        "val_perplexity": val_ppl,
-                    },
-                )
-                artifact.add_file(str(checkpoint_path))
-                artifact.add_file(str(data_cfg_path))
-                artifact.add_file(str(model_cfg_path))
-                wandb.log_artifact(artifact, aliases=["best", f"step-{global_step}"])
-
-        if max_steps is not None and global_step >= max_steps:
-            logger.info("Reached max_steps=%d; stopping training.", max_steps)
-            break
-
-    if use_wandb:
-        wandb.finish()
-
-
-def main():
-    """CLI entry point for offline training."""
-    parser = build_train_offline_parser()
-    args = parser.parse_args()
-    train_offline(args)
-
-
-if __name__ == "__main__":
-    main()

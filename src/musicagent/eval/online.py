@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,7 +14,11 @@ from torch.utils.data import DataLoader
 
 from musicagent.cli import build_eval_online_parser
 from musicagent.config import DataConfig, OnlineConfig
-from musicagent.data import OnlineDataset, make_online_collate_fn
+from musicagent.data import (
+    OnlineDataset,
+    WeightedJointOnlineDataset,
+    make_online_collate_fn,
+)
 from musicagent.models import OnlineTransformer
 from musicagent.utils.core import safe_load_state_dict, setup_logging
 
@@ -31,6 +36,30 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_weights(weights: list[float], n: int) -> list[float]:
+    if not weights:
+        return [1.0 / n for _ in range(n)]
+    if len(weights) != n:
+        if len(weights) == 1:
+            weights = [weights[0]] * n
+        else:
+            weights = weights[:n] + [1.0] * max(0, n - len(weights))
+    total = sum(weights)
+    if total <= 0:
+        return [1.0 / n for _ in range(n)]
+    return [w / total for w in weights]
+
+
+def _resolve_sources(cfg: DataConfig) -> list[tuple[str, Path, float]]:
+    paths = cfg.data_processed_list or [cfg.data_processed]
+    weights = _normalize_weights(cfg.data_weights, len(paths))
+    sources: list[tuple[str, Path, float]] = []
+    for path, w in zip(paths, weights):
+        name = Path(path).name or str(path)
+        sources.append((name, Path(path), w))
+    return sources
 
 
 @dataclass
@@ -69,7 +98,6 @@ class OnlineEvalResult:
 
 def extract_melody_and_chords(
     interleaved: torch.Tensor,
-    melody_vocab_size: int,
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract melody frames and reference chord frames from interleaved sequence.
@@ -81,8 +109,6 @@ def extract_melody_and_chords(
 
     Args:
         interleaved: Interleaved sequence tensor.
-        melody_vocab_size: Size of melody vocabulary (unused in unified pipeline,
-            retained for API compatibility).
         pad_id: Padding token ID.
 
     Returns:
@@ -117,10 +143,6 @@ def extract_melody_and_chords_from_mask(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract melody frames and reference chord frames using is_melody mask.
 
-    With separate vocabs, input_ids contains:
-    - Melody tokens in melody vocab space at is_melody=True positions
-    - Chord tokens in chord vocab space at is_melody=False positions
-
     OnlineDataset format: [SOS, y₁, x₁, y₂, x₂, ..., y_T, x_T]
     - Position 0: SOS (chord, is_melody=False)
     - Odd positions (1, 3, 5, ...): chord tokens (is_melody=False)
@@ -132,8 +154,8 @@ def extract_melody_and_chords_from_mask(
         pad_id: Padding token ID.
 
     Returns:
-        melody_frames: Tensor of melody token IDs (melody vocab space).
-        ref_chord_frames: Tensor of chord token IDs (chord vocab space).
+        melody_frames: Tensor of melody token IDs.
+        ref_chord_frames: Tensor of chord token IDs.
     """
     # Skip SOS at position 0
     seq = input_ids[1:]  # Now: [y₁, x₁, y₂, x₂, ...]
@@ -169,9 +191,7 @@ def evaluate_online(
     test_loader: DataLoader,
     d_cfg: DataConfig,
     device: torch.device,
-    melody_vocab_size: int,
-    id_to_melody: dict[int, str] | None = None,
-    id_to_chord: dict[int, str] | None = None,
+    id_to_token: dict[int, str] | None = None,
     temperature: float = 1.0,
     sample: bool = False,
     log_progress: bool = True,
@@ -182,9 +202,7 @@ def evaluate_online(
         model: Trained OnlineTransformer model (already on device, in eval mode)
         test_loader: DataLoader for test set (using OnlineDataset)
         d_cfg: Data configuration
-        id_to_melody: Mapping from melody token IDs to strings
-        id_to_chord: Mapping from chord token IDs to strings
-        melody_vocab_size: Size of melody vocabulary (kept for API compatibility)
+        id_to_token: Mapping from token IDs to strings
         device: Device to run evaluation on
         temperature: Sampling temperature (only used with sample=True)
         sample: If True, sample from distribution; otherwise greedy decode
@@ -199,24 +217,17 @@ def evaluate_online(
 
     dataset = getattr(test_loader, "dataset", None)
 
-    # Online model also uses separate embedding tables and vocabularies for
-    # melody and chord tokens. For evaluation we therefore require explicit
-    # per‑vocab ID→token mappings and do not fall back to any unified vocab.
-    if id_to_melody is None or id_to_chord is None:
+    # Resolve ID → token mapping from the dataset if not provided.
+    if id_to_token is None:
         if dataset is None:
             raise ValueError(
-                "id_to_melody/id_to_chord not provided and test_loader has no dataset."
+                "id_to_token not provided and test_loader has no dataset."
             )
 
-        if hasattr(dataset, "melody_id_to_token") and hasattr(dataset, "chord_id_to_token"):
-            id_to_melody = dataset.melody_id_to_token  # type: ignore[assignment]
-            id_to_chord = dataset.chord_id_to_token  # type: ignore[assignment]
+        if hasattr(dataset, "id_to_token"):
+            id_to_token = dataset.id_to_token  # type: ignore[assignment]
         else:
-            raise ValueError(
-                "OnlineDataset must expose melody_id_to_token and "
-                "chord_id_to_token for decoding; unified vocab fallbacks are "
-                "no longer supported."
-            )
+            raise ValueError("OnlineDataset must expose id_to_token for decoding.")
 
     # --- 1. Test loss / perplexity (teacher-forced, chord positions only) ---
     criterion = nn.CrossEntropyLoss(ignore_index=d_cfg.pad_id, reduction="sum")
@@ -321,9 +332,9 @@ def evaluate_online(
                     sample=sample,
                 )[0]
 
-                mel_tokens = decode_tokens(melody_frames.cpu().tolist(), id_to_melody)
-                pred_tokens = decode_tokens(pred_chords.cpu().tolist(), id_to_chord)
-                ref_tokens = decode_tokens(ref_chord_frames.cpu().tolist(), id_to_chord)
+                mel_tokens = decode_tokens(melody_frames.cpu().tolist(), id_to_token)
+                pred_tokens = decode_tokens(pred_chords.cpu().tolist(), id_to_token)
+                ref_tokens = decode_tokens(ref_chord_frames.cpu().tolist(), id_to_token)
 
                 # Cache predictions
                 result.cached_predictions[global_idx] = (mel_tokens, pred_tokens, ref_tokens)
@@ -422,8 +433,18 @@ def main():
         m_cfg.device = args.device
     device = torch.device(m_cfg.device)
 
-    # Load test dataset
-    test_ds = OnlineDataset(d_cfg, split="test")
+    # Load test dataset (supports weighted multi-source)
+    sources = _resolve_sources(d_cfg)
+    if len(sources) > 1:
+        test_ds = WeightedJointOnlineDataset(
+            d_cfg,
+            sources,
+            split="test",
+            eval_mode=True,
+            seed=42,
+        )
+    else:
+        test_ds = OnlineDataset(d_cfg, split="test")
     collate = make_online_collate_fn(pad_id=d_cfg.pad_id)
     test_loader = DataLoader(
         test_ds,
@@ -432,14 +453,12 @@ def main():
         collate_fn=collate,
     )
 
-    # Load model with separate vocab sizes
-    melody_vocab_size = test_ds.melody_vocab_size
-    chord_vocab_size = test_ds.chord_vocab_size
+    # Load model with unified vocab size
+    vocab_size = test_ds.vocab_size
     model = OnlineTransformer(
         m_cfg,
         d_cfg,
-        melody_vocab_size=melody_vocab_size,
-        chord_vocab_size=chord_vocab_size,
+        vocab_size=vocab_size,
     ).to(device)
     state_dict = safe_load_state_dict(args.checkpoint, map_location=device)
     model.load_state_dict(state_dict)
@@ -451,7 +470,6 @@ def main():
         model=model,
         test_loader=test_loader,
         d_cfg=d_cfg,
-        melody_vocab_size=melody_vocab_size,
         device=device,
         temperature=args.temperature,
         sample=args.sample,

@@ -13,6 +13,9 @@ class DataConfig:
     # Paths
     data_raw: Path = Path("sheetsage-data/hooktheory/Hooktheory.json")
     data_processed: Path = Path("realchords_data")
+    # Optional multi-dataset support for weighted sampling
+    data_processed_list: list[Path] = field(default_factory=list)
+    data_weights: list[float] = field(default_factory=list)
 
     # Constants
     frame_rate: int = 4  # 16th notes
@@ -20,6 +23,7 @@ class DataConfig:
     max_len: int = 256
     storage_len: int = 1024  # For random cropping
     max_transpose: int = 6  # For augmentation
+    augment_range: tuple[int, int] = (-6, 6)
 
     # Tokens
     pad_token: str = "<pad>"
@@ -33,20 +37,14 @@ class DataConfig:
     eos_id: int = 2
     rest_id: int = 3
 
-    @property
-    def vocab_unified(self) -> Path:
-        """Path to unified (melody + chord) vocabulary."""
-        return self.data_processed / "vocab_unified.json"
+    # Training-time sampling controls
+    train_samples_multiplier: float = 1.0
+    max_train_samples: int | None = None
 
     @property
-    def vocab_melody(self) -> Path:
-        """Path to melody-only vocabulary."""
-        return self.data_processed / "vocab_melody.json"
-
-    @property
-    def vocab_chord(self) -> Path:
-        """Path to chord-only vocabulary."""
-        return self.data_processed / "vocab_chord.json"
+    def vocab(self) -> Path:
+        """Path to the single vocabulary file used everywhere."""
+        return self.data_processed / "vocab.json"
 
 
 @dataclass

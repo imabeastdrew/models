@@ -23,3 +23,8 @@ Thumbs.db
 docs/
 *.tar.gz
 *.png
+POP909-Dataset/
+*torch/
+Wikifonia/
+Nottingham/
+POP909-Dataset/

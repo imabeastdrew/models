@@ -1,23 +1,37 @@
-"""Script for online model."""
+"""Lightning-based components for online (decoder-only) training.
 
-import argparse
+This module defines:
+- ``OnlineLightningModule``: wraps ``OnlineTransformer`` in a LightningModule.
+- ``build_online_module_and_loaders``: constructs datasets, dataloaders, and module
+  from ``DataConfig`` and ``OnlineConfig``.
+
+There is intentionally **no CLI** here; training should be driven by configs and an
+external script that instantiates a ``lightning.Trainer``.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import math
-import time
 from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Tuple
 
+import lightning as L
 import torch
 import torch.nn as nn
-import wandb
 from torch.utils.data import DataLoader
+from torch.utils.data.sampler import WeightedRandomSampler
 from transformers import Adafactor
 
-from musicagent.cli import build_train_online_parser
 from musicagent.config import DataConfig, OnlineConfig
-from musicagent.data.online import OnlineDataset, make_online_collate_fn
+from musicagent.data import (
+    WeightedJointOnlineDataset,
+    make_online_collate_fn,
+)
+from musicagent.data.online import OnlineDataset
 from musicagent.models import OnlineTransformer
-from musicagent.utils import seed_everything, setup_logging
 from musicagent.utils.train import (
     count_parameters,
     get_constant_schedule_with_warmup,
@@ -28,414 +42,291 @@ from musicagent.utils.train import (
 logger = logging.getLogger(__name__)
 
 
-def train_steps(
-    model,
-    loader,
-    optimizer,
-    scheduler,
-    criterion,
-    device,
-    global_step,
-    use_wandb: bool = True,
-    log_interval: int = 100,
-    max_steps: int | None = None,
-    grad_clip: float = 0.5,
-):
-    """Train for a series of steps over the given loader.
+def _normalize_weights(weights: list[float], n: int) -> list[float]:
+    if not weights:
+        return [1.0 / n for _ in range(n)]
+    if len(weights) != n:
+        if len(weights) == 1:
+            weights = [weights[0]] * n
+        else:
+            weights = weights[:n] + [1.0] * max(0, n - len(weights))
+    total = sum(weights)
+    if total <= 0:
+        return [1.0 / n for _ in range(n)]
+    return [w / total for w in weights]
 
-    For the online model, the DataLoader yields interleaved sequences
-    ``[SOS, y₁, x₁, y₂, x₂, ...]`` from :class:`OnlineDataset`. We perform
-    next‑token prediction but only train on chord tokens ``y_t``; loss
-    contributions from melody tokens ``x_t`` are masked out.
-    """
-    model.train()
-    total_loss = 0.0
-    start_time = time.time()
 
-    for i, batch in enumerate(loader):
-        if max_steps is not None and global_step >= max_steps:
-            break
-        input_ids = batch["input_ids"].to(device)
-        is_melody = batch["is_melody"].to(device)
+def _resolve_sources(cfg: DataConfig) -> list[tuple[str, Path, float]]:
+    paths = cfg.data_processed_list or [cfg.data_processed]
+    weights = _normalize_weights(cfg.data_weights, len(paths))
+    sources: list[tuple[str, Path, float]] = []
+    for path, w in zip(paths, weights):
+        name = Path(path).name or str(path)
+        sources.append((name, Path(path), w))
+    return sources
 
-        # Standard next-token prediction over the interleaved sequence:
-        #
-        #   full sequence: [SOS, y₁, x₁, ..., yₙ, xₙ]
-        #   inputs       = [SOS, y₁, x₁, ..., yₙ]       (drops last token)
-        #   targets      = [y₁,  x₁, y₂, ..., yₙ, xₙ]  (shifted left by 1)
-        #
+
+class OnlineLightningModule(L.LightningModule):
+    """LightningModule wrapping the online decoder-only transformer."""
+
+    def __init__(
+        self,
+        data_cfg: DataConfig,
+        model_cfg: OnlineConfig,
+        vocab_size: int,
+        max_steps: int,
+        lr_schedule: str = "constant",
+        save_dir: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.data_cfg = data_cfg
+        self.model_cfg = model_cfg
+        self.vocab_size = vocab_size
+        self.max_steps = max_steps
+        self.lr_schedule = lr_schedule
+        self.save_dir = save_dir or Path("checkpoints/online")
+
+        self.model = OnlineTransformer(
+            model_cfg,
+            data_cfg,
+            vocab_size=vocab_size,
+        )
+        # Gradient checkpointing for memory efficiency
+        self.model.enable_gradient_checkpointing()
+
+        self.criterion = nn.CrossEntropyLoss(
+            ignore_index=data_cfg.pad_id,
+            label_smoothing=model_cfg.label_smoothing,
+        )
+        self.best_val_loss: float = float("inf")
+
+        self.save_hyperparameters(
+            {
+                "data_cfg": asdict(data_cfg),
+                "model_cfg": asdict(model_cfg),
+                "max_steps": max_steps,
+                "lr_schedule": lr_schedule,
+            }
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        is_melody: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model(input_ids, is_melody)
+
+    def _shift_and_mask(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids = batch["input_ids"]
+        is_melody = batch["is_melody"]
+
         inputs = input_ids[:, :-1]
         is_melody_inputs = is_melody[:, :-1]
         targets = input_ids[:, 1:].clone()
 
-        # Mask out melody positions in the target so we only optimize chords.
-        # In `targets`, chord tokens live at even time indices (0, 2, 4, ...),
-        # and melody tokens at odd indices (1, 3, 5, ...).
-        pad_id = model.pad_id
+        # Mask out melody positions so we only optimize chords.
+        pad_id = self.model.pad_id
         targets[:, 1::2] = pad_id
+        return (inputs, is_melody_inputs), targets
 
-        optimizer.zero_grad(set_to_none=True)
-        output = model(inputs, is_melody_inputs)
+    def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        (inputs, is_melody_inputs), targets = self._shift_and_mask(batch)
+        output = self(inputs, is_melody_inputs)
+        loss = self.criterion(output.reshape(-1, output.size(-1)), targets.reshape(-1))
 
-        # Flatten for loss computation
-        loss = criterion(output.reshape(-1, output.size(-1)), targets.reshape(-1))
-        loss.backward()
+        self.log(
+            "train/loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        return loss
 
-        if grad_clip is not None and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-        scheduler.step()
+    def validation_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        (inputs, is_melody_inputs), targets = self._shift_and_mask(batch)
+        output = self(inputs, is_melody_inputs)
 
-        total_loss += loss.item()
-        global_step += 1
+        flat_output = output.reshape(-1, output.size(-1))
+        flat_targets = targets.reshape(-1)
+        loss = self.criterion(flat_output, flat_targets)
 
-        if global_step % log_interval == 0:
-            cur_loss = total_loss / log_interval
-            elapsed = time.time() - start_time
-            lr = scheduler.get_last_lr()[0]
-            ms_per_batch = elapsed * 1000 / log_interval
-
-            logger.info(
-                f"| step {global_step} | batch {i}/{len(loader)} | "
-                f"ms/batch {ms_per_batch:.2f} | "
-                f"lr {lr:.6f} | loss {cur_loss:.4f}"
-            )
-
-            if use_wandb:
-                wandb.log(
-                    {
-                        "train/loss": cur_loss,
-                        "train/lr": lr,
-                        "train/ms_per_batch": ms_per_batch,
-                    },
-                    step=global_step,
-                )
-
-            total_loss = 0.0
-            start_time = time.time()
-
-    return global_step
-
-
-def evaluate(model, loader, criterion, device):
-    """Evaluate model on validation/test set.
-
-    Note:
-        The returned loss is the *mean of per-batch cross-entropies*, i.e.
-        effectively averaged per sample, not strictly normalized by the total
-        number of (non-ignored) tokens. This is sufficient for tracking
-        training progress but is not a calibrated per-token NLL.
-    """
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    with torch.no_grad():
-        for batch in loader:
-            input_ids = batch["input_ids"].to(device)
-            is_melody = batch["is_melody"].to(device)
-
-            inputs = input_ids[:, :-1]
-            is_melody_inputs = is_melody[:, :-1]
-            targets = input_ids[:, 1:].clone()
-
-            # Apply the same chord-only masking used in training.
-            pad_id = model.pad_id
-            targets[:, 1::2] = pad_id
-
-            output = model(inputs, is_melody_inputs)
-
-            flat_output = output.reshape(-1, output.size(-1))
-            flat_targets = targets.reshape(-1)
-
-            loss = criterion(flat_output, flat_targets)
-
-            batch_size = input_ids.size(0)
-            total_loss += loss.item() * batch_size
-            total_tokens += batch_size
-
-    if total_tokens == 0:
-        return 0.0
-
-    return total_loss / total_tokens
-
-
-def train_online(args: argparse.Namespace) -> None:
-    """Main training function for online model (MLE pretraining)."""
-    setup_logging()
-    seed_everything(args.seed, deterministic=args.deterministic)
-    args.save_dir.mkdir(exist_ok=True, parents=True)
-
-    d_cfg = DataConfig()
-    m_cfg = OnlineConfig()
-
-    # Apply CLI overrides
-    if args.max_len is not None:
-        d_cfg.max_len = args.max_len
-    if args.storage_len is not None:
-        d_cfg.storage_len = args.storage_len
-    if args.max_transpose is not None:
-        d_cfg.max_transpose = args.max_transpose
-
-    if args.d_model is not None:
-        m_cfg.d_model = args.d_model
-    if args.n_heads is not None:
-        m_cfg.n_heads = args.n_heads
-    if args.n_layers is not None:
-        m_cfg.n_layers = args.n_layers
-    if args.dropout is not None:
-        m_cfg.dropout = args.dropout
-    if args.batch_size is not None:
-        m_cfg.batch_size = args.batch_size
-    if args.lr is not None:
-        m_cfg.lr = args.lr
-    if args.warmup_steps is not None:
-        m_cfg.warmup_steps = args.warmup_steps
-    if args.label_smoothing is not None:
-        m_cfg.label_smoothing = args.label_smoothing
-    if args.grad_clip is not None:
-        m_cfg.grad_clip = args.grad_clip
-    if args.weight_decay is not None:
-        m_cfg.weight_decay = args.weight_decay
-
-    # Validate configuration
-    if m_cfg.d_model % m_cfg.n_heads != 0:
-        raise ValueError(
-            f"d_model ({m_cfg.d_model}) must be divisible by n_heads ({m_cfg.n_heads})"
+        self.log(
+            "valid/loss",
+            loss,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
         )
 
-    if args.device:
-        m_cfg.device = args.device
+        with torch.no_grad():
+            val = float(loss.detach().cpu())
+            ppl = math.exp(min(val, 100.0))
+        self.log(
+            "valid/perplexity",
+            ppl,
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+        )
+        return loss
 
-    device = torch.device(m_cfg.device)
-    logger.info(f"Using device: {device}")
+    def on_validation_epoch_end(self) -> None:
+        metrics = self.trainer.callback_metrics
+        val_loss = metrics.get("valid/loss")
+        if val_loss is None:
+            return
+        loss_value = float(val_loss.detach().cpu())
+        if loss_value < self.best_val_loss:
+            self.best_val_loss = loss_value
+            self._save_best_checkpoint(loss_value)
+
+    def _save_best_checkpoint(self, val_loss: float) -> None:
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = self.save_dir / "best_model.pt"
+        torch.save(self.model.state_dict(), checkpoint_path)
+
+        data_cfg_path = self.save_dir / "data_config.json"
+        model_cfg_path = self.save_dir / "model_config.json"
+        with data_cfg_path.open("w") as f:
+            json.dump(asdict(self.data_cfg), f, default=str, indent=2)
+        with model_cfg_path.open("w") as f:
+            json.dump(asdict(self.model_cfg), f, default=str, indent=2)
+
+        logger.info(
+            "Saved best online model to %s (val_loss=%.4f)",
+            checkpoint_path,
+            val_loss,
+        )
+
+    def configure_optimizers(self):
+        optimizer = Adafactor(
+            self.parameters(),
+            lr=self.model_cfg.lr,
+            weight_decay=self.model_cfg.weight_decay,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False,
+        )
+
+        if self.lr_schedule == "linear":
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+                num_training_steps=self.max_steps,
+            )
+        elif self.lr_schedule == "cosine":
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+                num_training_steps=self.max_steps,
+            )
+        else:
+            scheduler = get_constant_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=self.model_cfg.warmup_steps,
+            )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
+
+
+def build_online_module_and_loaders(
+    data_cfg: DataConfig,
+    model_cfg: OnlineConfig,
+    *,
+    max_steps: int,
+    lr_schedule: str = "constant",
+    save_dir: Path | None = None,
+    seed: int = 42,
+) -> Tuple[OnlineLightningModule, DataLoader, DataLoader]:
+    """Create OnlineLightningModule and train/valid DataLoaders from configs.
+
+    This is the preferred entry point for config-driven online MLE training. Example:
+
+    .. code-block:: python
+
+        data_cfg = DataConfig(data_processed=Path("realchords_data"))
+        model_cfg = OnlineConfig()
+        module, train_loader, valid_loader = build_online_module_and_loaders(
+            data_cfg, model_cfg, max_steps=100_000
+        )
+        trainer = L.Trainer(max_steps=100_000, gradient_clip_val=model_cfg.grad_clip)
+        trainer.fit(module, train_loader, valid_loader)
+    """
+    del seed  # reserved for future use
+
+    if model_cfg.d_model % model_cfg.n_heads != 0:
+        raise ValueError(
+            f"d_model ({model_cfg.d_model}) must be divisible by n_heads ({model_cfg.n_heads})"
+        )
+
+    sources = _resolve_sources(data_cfg)
+    use_joint = len(sources) > 1
 
     try:
-        train_ds = OnlineDataset(d_cfg, split="train")
-        valid_ds = OnlineDataset(d_cfg, split="valid")
+        if use_joint:
+            logger.info(
+                "Using weighted joint online datasets: %s",
+                [(n, str(p), w) for n, p, w in sources],
+            )
+            train_ds = WeightedJointOnlineDataset(data_cfg, sources, split="train")
+            valid_ds = WeightedJointOnlineDataset(
+                data_cfg, sources, split="valid", eval_mode=True
+            )
+        else:
+            train_ds = OnlineDataset(data_cfg, split="train")
+            valid_ds = OnlineDataset(data_cfg, split="valid")
     except FileNotFoundError as e:
         logger.error(e)
-        return
+        raise
 
-    collate_fn = make_online_collate_fn(pad_id=d_cfg.pad_id)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=m_cfg.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-    )
-    valid_loader = DataLoader(
-        valid_ds,
-        batch_size=m_cfg.batch_size,
-        collate_fn=collate_fn,
-    )
-
-    # Get vocab sizes from dataset
-    melody_vocab_size = train_ds.melody_vocab_size
-    chord_vocab_size = train_ds.chord_vocab_size
-    logger.info(
-        "Vocab Size: Melody=%d, Chord=%d",
-        melody_vocab_size,
-        chord_vocab_size,
-    )
-
-    # Online model uses separate embedding tables for melody and chord tokens.
-    # During forward pass, is_melody mask selects which embedding to apply.
-    model = OnlineTransformer(
-        m_cfg,
-        d_cfg,
-        melody_vocab_size=melody_vocab_size,
-        chord_vocab_size=chord_vocab_size,
-    ).to(device)
-
-    # Enable gradient checkpointing to reduce activation memory during training.
-    model.enable_gradient_checkpointing()
-    total_params = count_parameters(model)
-    logger.info(f"Model Parameters: {total_params:,}")
-
-    # Optionally resume from checkpoint
-    if args.resume_from is not None:
-        if args.resume_from.is_file():
-            state_dict = torch.load(args.resume_from, map_location=device)
-            model.load_state_dict(state_dict, strict=True)
-            logger.info(f"Loaded checkpoint from {args.resume_from}")
-        else:
-            logger.warning(
-                f"--resume-from was set to {args.resume_from}, but file does not exist. "
-                "Continuing with randomly initialized weights."
-            )
-
-    # Adafactor optimizer, matching the paper's setup.
-    optimizer = Adafactor(
-        model.parameters(),
-        lr=m_cfg.lr,
-        weight_decay=m_cfg.weight_decay,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-    )
-
-    # Use unified vocab's pad_id for loss masking
-    # In the unified vocab, pad_id is the same as melody's pad_id (0)
-    criterion = nn.CrossEntropyLoss(
-        ignore_index=d_cfg.pad_id,
-        label_smoothing=m_cfg.label_smoothing,
-    )
-
-    # Training schedule is purely step-based: --max-steps must be provided
-    # and determines when training stops.
-    if args.max_steps is None:
-        raise ValueError(
-            "train_online uses step-based training; pass "
-            "`--max-steps` to specify the total number of optimizer steps."
-        )
-    max_steps = args.max_steps
-
-    # Learning rate schedule: warmup+constant (paper-faithful), warmup+linear
-    # decay, or warmup+cosine decay to zero over the full training horizon.
-    schedule = getattr(args, "lr_schedule", "constant")
-    if schedule == "linear":
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
-            num_training_steps=max_steps,
-        )
-    elif schedule == "cosine":
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
-            num_training_steps=max_steps,
+    collate_fn = make_online_collate_fn(pad_id=data_cfg.pad_id)
+    if use_joint:
+        num_samples = int(math.ceil(len(train_ds) * data_cfg.train_samples_multiplier))
+        if data_cfg.max_train_samples is not None:
+            num_samples = min(num_samples, data_cfg.max_train_samples)
+        num_samples = max(1, num_samples)
+        sampler = WeightedRandomSampler(train_ds.sample_weights, num_samples, replacement=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=model_cfg.batch_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
         )
     else:
-        scheduler = get_constant_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=m_cfg.warmup_steps,
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=model_cfg.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
         )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=model_cfg.batch_size,
+        collate_fn=collate_fn,
+    )
 
-    # Initialize wandb
-    use_wandb = not args.no_wandb
-    if use_wandb:
-        run_name = args.run_name or (
-            f"online_d{m_cfg.d_model}_h{m_cfg.n_heads}_L{m_cfg.n_layers}_bs{m_cfg.batch_size}"
-        )
+    vocab_size = train_ds.vocab_size
+    logger.info("Online vocab size: %d", vocab_size)
 
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config={
-                "model_type": "online",
-                **asdict(m_cfg),
-                "max_len": d_cfg.max_len,
-                "frame_rate": d_cfg.frame_rate,
-                "storage_len": d_cfg.storage_len,
-                "melody_vocab_size": melody_vocab_size,
-                "chord_vocab_size": chord_vocab_size,
-                "total_params": total_params,
-                "train_samples": len(train_ds),
-                "valid_samples": len(valid_ds),
-                "total_steps": max_steps,
-            },
-            tags=["transformer", "online", "melody-chord", "realchords"],
-        )
+    module = OnlineLightningModule(
+        data_cfg=data_cfg,
+        model_cfg=model_cfg,
+        vocab_size=vocab_size,
+        max_steps=max_steps,
+        lr_schedule=lr_schedule,
+        save_dir=save_dir or Path("checkpoints/online"),
+    )
 
-        wandb.define_metric("train/loss", summary="min")
-        wandb.define_metric("valid/loss", summary="min")
-        wandb.define_metric("valid/perplexity", summary="min")
+    total_params = count_parameters(module.model)
+    logger.info("Online model parameters: %d", total_params)
 
-    best_val_loss = float("inf")
-    global_step = 0
+    return module, train_loader, valid_loader
 
-    # Train until we hit the requested number of steps. Validation and
-    # checkpointing are performed after each full pass through the loader (or
-    # earlier if we exhaust the step budget mid-pass).
-    while global_step < max_steps:
-        global_step = train_steps(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            criterion,
-            device,
-            global_step,
-            use_wandb,
-            max_steps=max_steps,
-            grad_clip=m_cfg.grad_clip,
-        )
-        val_loss = evaluate(model, valid_loader, criterion, device)
-        try:
-            val_ppl = math.exp(min(val_loss, 100))
-        except OverflowError:
-            val_ppl = float("inf")
-
-        logger.info("-" * 89)
-        logger.info(
-            f"| Validation | step {global_step} | "
-            f"valid loss {val_loss:.4f} | perplexity {val_ppl:.2f}"
-        )
-        logger.info("-" * 89)
-
-        if use_wandb:
-            wandb.log(
-                {
-                    "valid/loss": val_loss,
-                    "valid/perplexity": val_ppl,
-                    "valid/step": global_step,
-                },
-                step=global_step,
-            )
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            checkpoint_path = args.save_dir / "best_model.pt"
-            torch.save(model.state_dict(), checkpoint_path)
-            logger.info("Saved best model.")
-
-            # Persist the effective data/model configs alongside the checkpoint
-            data_cfg_path = args.save_dir / "data_config.json"
-            model_cfg_path = args.save_dir / "model_config.json"
-            with data_cfg_path.open("w") as f:
-                json.dump(asdict(d_cfg), f, default=str, indent=2)
-            with model_cfg_path.open("w") as f:
-                json.dump(asdict(m_cfg), f, default=str, indent=2)
-            logger.info("Saved data/model configs.")
-
-            if use_wandb and wandb.run is not None:
-                wandb.run.summary["best_val_loss"] = best_val_loss
-                try:
-                    wandb.run.summary["best_val_perplexity"] = math.exp(min(best_val_loss, 100))
-                except OverflowError:
-                    wandb.run.summary["best_val_perplexity"] = float("inf")
-                wandb.run.summary["best_step"] = global_step
-
-                artifact = wandb.Artifact(
-                    name="best-online-model",
-                    type="model",
-                    metadata={
-                        "model_type": "online",
-                        "step": global_step,
-                        "val_loss": val_loss,
-                        "val_perplexity": val_ppl,
-                    },
-                )
-                artifact.add_file(str(checkpoint_path))
-                artifact.add_file(str(data_cfg_path))
-                artifact.add_file(str(model_cfg_path))
-                wandb.log_artifact(artifact, aliases=["best", f"step-{global_step}"])
-
-        if max_steps is not None and global_step >= max_steps:
-            logger.info("Reached max_steps=%d; stopping training.", max_steps)
-            break
-
-    if use_wandb:
-        wandb.finish()
-
-
-def main():
-    """CLI entry point for online training."""
-    parser = build_train_online_parser()
-    args = parser.parse_args()
-    train_online(args)
-
-
-if __name__ == "__main__":
-    main()

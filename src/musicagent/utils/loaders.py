@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from musicagent.config import DataConfig
+from musicagent.data import WeightedJointOfflineDataset, WeightedJointOnlineDataset
 
 from .config import load_configs_from_dir
 from .core import safe_load_state_dict
@@ -55,23 +56,23 @@ def load_model_from_artifact(
     d_cfg, m_cfg = load_configs_from_dir(artifact_dir, reg.config_class)
     m_cfg.device = str(device)
 
-    # Get vocab sizes from a temporary dataset
-    temp_ds: Any = reg.dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
+    # Get vocab size from a temporary dataset
+    dataset_class = reg.dataset_class
+    if model_type == "online" and d_cfg.data_processed_list:
+        dataset_class = WeightedJointOnlineDataset  # type: ignore[assignment]
+    if model_type == "offline" and d_cfg.data_processed_list:
+        dataset_class = WeightedJointOfflineDataset  # type: ignore[assignment]
 
-    melody_vocab_size = getattr(temp_ds, "melody_vocab_size", None)
-    chord_vocab_size = getattr(temp_ds, "chord_vocab_size", None)
+    temp_ds: Any = dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
+    vocab_size = getattr(temp_ds, "vocab_size", None)
 
-    if melody_vocab_size is None or chord_vocab_size is None:
-        raise AttributeError(
-            "Dataset does not expose melody_vocab_size / chord_vocab_size "
-            "required for model construction."
-        )
+    if vocab_size is None:
+        raise AttributeError("Dataset does not expose vocab_size required for model construction.")
 
     model = reg.model_class(
         m_cfg,
         d_cfg,
-        melody_vocab_size=melody_vocab_size,
-        chord_vocab_size=chord_vocab_size,
+        vocab_size=vocab_size,
     )
 
     model = model.to(device)
@@ -90,14 +91,10 @@ class TestLoaderResult:
     """The test DataLoader."""
     test_dataset: Any  # Dataset
     """The test dataset."""
-    id_to_melody: dict[int, str]
-    """Mapping from melody token ID to string."""
-    id_to_chord: dict[int, str]
-    """Mapping from chord token ID to string."""
-    melody_vocab_size: int
-    """Size of melody vocabulary."""
-    chord_vocab_size: int
-    """Size of chord vocabulary."""
+    id_to_token: dict[int, str]
+    """Mapping from token ID to string."""
+    vocab_size: int
+    """Size of vocabulary."""
 
 
 def create_test_loader(
@@ -119,7 +116,13 @@ def create_test_loader(
 
     reg = get_model_registry(model_type)
 
-    test_ds: Any = reg.dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
+    dataset_class = reg.dataset_class
+    if model_type == "online" and d_cfg.data_processed_list:
+        dataset_class = WeightedJointOnlineDataset  # type: ignore[assignment]
+    if model_type == "offline" and d_cfg.data_processed_list:
+        dataset_class = WeightedJointOfflineDataset  # type: ignore[assignment]
+
+    test_ds: Any = dataset_class(d_cfg, split="test")  # type: ignore[call-arg]
     collate_fn = reg.collate_fn_maker(pad_id=d_cfg.pad_id)
     test_loader = DataLoader(
         test_ds,
@@ -128,16 +131,13 @@ def create_test_loader(
         collate_fn=collate_fn,
     )
 
-    id_to_melody: dict[int, str] = {v: k for k, v in test_ds.vocab_melody.items()}
-    id_to_chord: dict[int, str] = {v: k for k, v in test_ds.vocab_chord.items()}
+    id_to_token: dict[int, str] = getattr(test_ds, "id_to_token", {})
 
     return TestLoaderResult(
         test_loader=test_loader,
         test_dataset=test_ds,
-        id_to_melody=id_to_melody,
-        id_to_chord=id_to_chord,
-        melody_vocab_size=test_ds.melody_vocab_size,
-        chord_vocab_size=test_ds.chord_vocab_size,
+        id_to_token=id_to_token,
+        vocab_size=getattr(test_ds, "vocab_size", 0),
     )
 
 
@@ -220,9 +220,7 @@ def evaluate_checkpoint(
             test_loader=loader.test_loader,
             d_cfg=loaded.d_cfg,
             device=loaded.device,
-            melody_vocab_size=loader.melody_vocab_size,
-            id_to_melody=loader.id_to_melody,
-            id_to_chord=loader.id_to_chord,
+            id_to_token=loader.id_to_token,
             temperature=temperature,
             sample=sample,
             log_progress=log_progress,
@@ -233,8 +231,7 @@ def evaluate_checkpoint(
             test_loader=loader.test_loader,
             d_cfg=loaded.d_cfg,
             device=loaded.device,
-            id_to_melody=loader.id_to_melody,
-            id_to_chord=loader.id_to_chord,
+            id_to_token=loader.id_to_token,
             temperature=temperature,
             sample=sample,
             log_progress=log_progress,

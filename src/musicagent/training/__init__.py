@@ -1,34 +1,23 @@
-"""Training modules for MusicAgent."""
+"""Training components for MusicAgent.
 
-import argparse
-import sys
+This package exposes LightningModules and helper constructors for offline and
+online training. There is no CLI entrypoint; training is expected to be driven
+via configs and external scripts (e.g., W&B sweeps).
+"""
 
-from musicagent.training.offline import main as offline_main
-from musicagent.training.offline import train_offline
-from musicagent.training.online import main as online_main
-from musicagent.training.online import train_online
+from musicagent.training.offline import (
+    OfflineLightningModule,
+    build_offline_module_and_loaders,
+)
+from musicagent.training.online import (
+    OnlineLightningModule,
+    build_online_module_and_loaders,
+)
 
 __all__ = [
-    "train_offline",
-    "train_online",
+    "OfflineLightningModule",
+    "OnlineLightningModule",
+    "build_offline_module_and_loaders",
+    "build_online_module_and_loaders",
 ]
 
-
-def main() -> None:
-    """Unified entry point for training (online or offline mode)."""
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument(
-        "--mode",
-        choices=["online", "offline"],
-        default="offline",
-        help="Training mode: 'online' or 'offline' (default: offline)",
-    )
-    args, remaining = parser.parse_known_args()
-
-    # Put remaining args back for the sub-command
-    sys.argv = [sys.argv[0]] + remaining
-
-    if args.mode == "online":
-        online_main()
-    else:
-        offline_main()

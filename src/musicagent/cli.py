@@ -68,6 +68,28 @@ def _build_train_parser(description: str, default_save_dir: Path) -> argparse.Ar
     )
     parser.add_argument("--device", type=str)
 
+    # Multi-dataset weighted sampling
+    parser.add_argument(
+        "--data-processed-list",
+        type=str,
+        help="Comma-separated list of processed data directories for weighted sampling.",
+    )
+    parser.add_argument(
+        "--data-weights",
+        type=str,
+        help="Comma-separated list of dataset weights aligned with --data-processed-list.",
+    )
+    parser.add_argument(
+        "--train-samples-multiplier",
+        type=float,
+        help="Multiplier for samples per epoch when using weighted sampling.",
+    )
+    parser.add_argument(
+        "--max-train-samples",
+        type=int,
+        help="Cap on samples per epoch when using weighted sampling.",
+    )
+
     return parser
 
 
